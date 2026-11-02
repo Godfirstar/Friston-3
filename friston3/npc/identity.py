@@ -15,7 +15,8 @@ class Identity:
     manufacturer: str = "罗德岛"
     creator_id: str = "closure"
     creator: str = "可露希尔"
-    capabilities: tuple = ("文字与离线语音交流", "拍照", "表情和小幅头部示意")
+    capabilities: tuple = ("文字与离线语音交流", "拍照", "表情和小幅头部示意",
+                           "调用已示教的机械臂动作（需要本机机械臂服务已使能）")
     unavailable: tuple = ("机械臂递物",)
 
 

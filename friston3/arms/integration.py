@@ -5,10 +5,17 @@ The service remains the authority for enabling, limits and motion completion.
 """
 from __future__ import annotations
 
+import importlib.util
+import math
+import os
+from pathlib import Path
+import subprocess
+import sys
 import threading
 import time
 
-from .config import GESTURES
+from .config import GESTURES, load_config
+from friston3.config import PROJECT_ROOT
 from friston3.runtime_settings import SETTINGS
 
 
@@ -27,7 +34,7 @@ def is_immediate_stop(instruction: str) -> bool:
 def _job_text(job) -> str:
     if not isinstance(job, dict):
         return "无"
-    states = {"accepted": "已接受，尚未确认完成", "running": "执行中",
+    states = {"accepted": "已接受，尚未确认完成", "loading": "加载策略与场景中", "running": "执行中",
               "completed": "已完成", "cancelled": "已取消", "failed": "失败"}
     state = str(job.get("status", "unknown"))
     summary = f"{job.get('name') or job.get('kind') or '任务'}：{states.get(state, state)}"
@@ -47,10 +54,10 @@ def describe_status(result: dict) -> str:
     available = "、".join(sides.get(str(arm), str(arm))
                          for arm in result.get("available_arms", [])) or "无"
     status = str(result.get("status", "unknown"))
-    states = {"starting": "正在连接", "stopping": "正在确认停止持姿", "idle": "就绪空闲",
+    states = {"starting": "正在连接", "loading": "加载策略与场景中", "stopping": "正在确认停止持姿", "idle": "就绪空闲",
               "running": "执行中", "accepted": "任务已接受", "ready": "就绪", "faulted": "故障"}
     summary = (f"{mode}；服务状态={states.get(status, status)}；配置={available}；"
-            f"{'已使能' if result.get('armed') else '未使能'}；"
+            f"示教动作{'已使能' if result.get('armed') else '未使能'}；"
             f"对话联动={'开启' if result.get('auto_enabled') else '关闭'}；"
             f"{'忙碌' if result.get('busy') else '空闲'}。"
             f"当前任务：{_job_text(result.get('current_job'))}。"
@@ -86,7 +93,8 @@ class ArmIntegration:
     """Explicit operations are bounded; optional automatic gestures never wait.
 
     Only one automatic request may be in flight. There is no cross-turn motion
-    queue, retry, automatic arming, or hardware startup. A fresh NPC result
+    queue, retry, or automatic arming. Explicit policy tasks can start their
+    configured background service; optional gestures never do. A fresh NPC result
     contributes at most one callback, consumed at the first audio clip (or at
     the text-only fallback).
     """
@@ -104,6 +112,9 @@ class ArmIntegration:
         self._last_job_id = None
         self._last_dialogue_job_id = None
         self._cleanup_ids = set()
+        self._startup_lock = threading.Lock()
+        self._service_process = None
+        self._service_command = None
 
     def _client(self):
         if self._client_factory is not None:
@@ -114,6 +125,8 @@ class ArmIntegration:
     def _request(self, operation: str, **arguments) -> dict:
         try:
             client = self._client()
+            if operation == "task":
+                self._ensure_task_service(client)
             result = client.status() if operation == "status" else client.command(operation, **arguments)
             if not isinstance(result, dict):
                 raise RuntimeError("机械臂服务未返回对象")
@@ -127,21 +140,146 @@ class ArmIntegration:
             return {"success": False, "status": "unavailable",
                     "message": f"机械臂服务未确认响应：{error}"}
 
+    @staticmethod
+    def _service_python(config):
+        explicit = os.environ.get("FRISTON_LEROBOT_PYTHON", "").strip() or config.get("python")
+        if explicit:
+            if not isinstance(explicit, str):
+                raise ValueError("机械臂 python 配置必须是解释器路径")
+            candidate = Path(explicit).expanduser()
+            if not candidate.is_absolute():
+                candidate = Path(config["config_path"]).parent / candidate
+            candidate = candidate.resolve()
+            if not candidate.is_file():
+                raise RuntimeError(f"配置的 LeRobot Python 不存在：{candidate}")
+            return candidate
+        executable = Path(sys.executable).resolve()
+        prefixes = [Path(sys.prefix), Path(sys.base_prefix), executable.parent,
+                    Path.home() / "anaconda3", Path.home() / "miniconda3"]
+        for key in ("CONDA_PREFIX", "_CONDA_ROOT"):
+            if os.environ.get(key):
+                prefixes.append(Path(os.environ[key]))
+        for key in ("CONDA_EXE", "CONDA_PYTHON_EXE"):
+            if os.environ.get(key):
+                prefix = Path(os.environ[key]).parent
+                prefixes.append(prefix.parent if prefix.name.lower() in ("scripts", "bin", "condabin") else prefix)
+        candidates = []
+        if Path(sys.prefix).name.lower() == "lerobot":
+            candidates.append(executable)
+        binary = Path("python.exe") if sys.platform == "win32" else Path("bin/python")
+        for prefix in prefixes:
+            if prefix.parent.name.lower() == "envs":
+                candidates.append(prefix.parent / "lerobot" / binary)
+            candidates.append(prefix / "envs" / "lerobot" / binary)
+        try:
+            if importlib.util.find_spec("lerobot") is not None:
+                candidates.append(executable)
+        except (ImportError, ValueError):
+            pass
+        seen = set()
+        for candidate in candidates:
+            candidate = candidate.resolve()
+            key = os.path.normcase(str(candidate))
+            if key not in seen and candidate.is_file():
+                return candidate
+            seen.add(key)
+        raise RuntimeError("没有找到已安装的 LeRobot Python；请在机械臂配置中填写 python，"
+                           "或设置 FRISTON_LEROBOT_PYTHON 指向现有环境解释器。")
+
+    @staticmethod
+    def _service_absent(error):
+        cause = error
+        while cause is not None:
+            if isinstance(cause, ConnectionRefusedError) or (
+                    isinstance(cause, OSError) and
+                    (cause.errno in (61, 111, 10061) or getattr(cause, "winerror", None) == 10061)):
+                return True
+            cause = cause.__cause__
+        return False
+
+    def _ensure_task_service(self, client):
+        """Health-check before POST; a submitted task is never retried."""
+        with self._startup_lock:
+            with self._lock:
+                if self._closed:
+                    raise RuntimeError("机械臂对话入口已关闭")
+            snapshot = None
+            try:
+                snapshot = client.status()
+            except (OSError, RuntimeError) as error:
+                if not self._service_absent(error) and client.is_listening():
+                    raise
+            if snapshot is not None:
+                if snapshot.get("success") is not True:
+                    raise RuntimeError(str(snapshot.get("message", "现有机械臂服务故障")))
+                if snapshot.get("ready") is True:
+                    return
+            config = load_config(self.config_path)
+            timeout = config.get("startup_timeout_s", 30.0)
+            if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+                raise ValueError("startup_timeout_s 必须是有限正数")
+            process = self._service_process if snapshot is None else None
+            if snapshot is None and (process is None or process.poll() is not None):
+                from friston3.runtime_bootstrap import interpreter_environment
+                python = self._service_python(config)
+                argv = [str(python), "-B", "-m", "friston3.arms", "--config",
+                        str(Path(config["config_path"]).resolve()), "serve"]
+                environment = interpreter_environment(python)
+                environment["PYTHONDONTWRITEBYTECODE"] = "1"
+                self._service_process = subprocess.Popen(
+                    argv, cwd=PROJECT_ROOT, env=environment,
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+                process = self._service_process
+                self._service_command = subprocess.list2cmdline(argv)
+                self._notify("正在后台启动已配置的 LeRobot 机械臂服务。")
+            deadline = time.monotonic() + timeout
+            last_error = "服务尚未就绪"
+            while time.monotonic() < deadline:
+                with self._lock:
+                    if self._closed:
+                        raise RuntimeError("机械臂对话入口已关闭；后台服务保持独立运行。")
+                try:
+                    snapshot = client.status()
+                except (OSError, RuntimeError) as error:
+                    last_error = str(error)
+                else:
+                    if snapshot.get("success") is not True:
+                        raise RuntimeError(str(snapshot.get("message", "机械臂服务启动失败")))
+                    if snapshot.get("ready") is True:
+                        return
+                    last_error = str(snapshot.get("message", "机械臂服务正在连接硬件"))
+                if process is not None:
+                    code = process.poll()
+                    if code is not None:
+                        raise RuntimeError(f"后台机械臂服务已退出，退出码 {code}。"
+                                           f"请运行 {self._service_command} 查看启动错误。"
+                                           f"最近状态：{last_error}")
+                time.sleep(0.1)
+            raise RuntimeError(f"等待机械臂服务就绪超过 {timeout:g} 秒：{last_error}。"
+                               "任务尚未提交；可查询机械臂状态后再次发出任务。")
+
     def cancel_pending(self) -> None:
         with self._lock:
             self._generation += 1
 
-    def perform(self, operation: str, *, name: str = "") -> dict:
-        """The planner can never arm, teach, or enable automatic execution."""
-        if operation not in ("status", "list", "stop", "play"):
-            raise ValueError("对话只开放 status、list、stop 和 play")
+    def perform(self, operation: str, *, name: str = "", instruction: str = "", arm=None) -> dict:
+        """Submit explicit tasks while keeping automatic gestures independent."""
+        if operation not in ("status", "list", "stop", "play", "task"):
+            raise ValueError("对话支持 status、list、stop、play 和 task")
         if operation == "stop":
             self.cancel_pending()
         arguments = {"name": name, "source": "manual"} if operation == "play" else {}
+        if operation == "task":
+            self.cancel_pending()
+            arguments = {"instruction": instruction, **({"arm": arm} if arm is not None else {})}
         result = self._request(operation, **arguments)
         result["operation"] = operation
-        if operation == "play":
+        if operation in ("play", "task"):
             self._remember_job(result)
+            if operation == "task" and result.get("success") is True and result.get("status") in ("accepted", "running"):
+                from friston3.llm import reserve_policy_memory
+                reserve_policy_memory(self.config_path)
         elif operation == "stop" and result.get("success") is True:
             with self._lock:
                 self._last_job_id = None
@@ -150,10 +288,11 @@ class ArmIntegration:
             if "message" in result:
                 result["service_message"] = result["message"]
             result["message"] = describe_status(result) if operation == "status" else describe_motions(result)
-        elif operation == "play" and result.get("status") in ("accepted", "running"):
+        elif operation in ("play", "task") and result.get("status") in ("accepted", "running"):
             result["service_message"] = result.get("message", "")
-            result["message"] = (f"已接受动作 {name}，实际执行结果尚未确认；"
-                                 "可查询机械臂状态查看进度。")
+            result["message"] = (("已接收取放任务，将根据当前画面和策略执行；成功取物尚未确认。"
+                                  if operation == "task" else f"已接受动作 {name}，实际执行结果尚未确认；")
+                                 + "可查询机械臂状态查看进度。")
             if result.get("mode") == "mock":
                 result["message"] = "模拟服务（无真实机械臂）：" + result["message"]
         # Query and acceptance are not physical completion. Preserve status,

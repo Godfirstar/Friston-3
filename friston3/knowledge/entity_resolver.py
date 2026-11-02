@@ -35,7 +35,7 @@ def _all_aliases(db):
     for entity in references:
         word = normalize(entity['name'])
         if (len(word) < 2 or len(word) > 24 or word in canonical
-                or _generic_speaker_label(word)
+                or generic_speaker_label(word)
                 or re.search(r'[（(；;]', entity['name'])):
             continue
         canonical.add(word)
@@ -108,7 +108,7 @@ def _explicit_speaker_reference(question, alias):
         r'(?:是谁|是什么人|是什么角色|的档案|这个角色|这个人物|吗)?', q))
 
 
-def _generic_speaker_label(name):
+def generic_speaker_label(name):
     name = normalize(name)
     roles = '|'.join(re.escape(role) for role in _GENERIC_SPEAKER_ROLES)
     return bool(re.fullmatch(
@@ -163,7 +163,7 @@ def _has_person_reference(question):
     return bool(initial and not name_question)
 
 
-def _ordinary_alias_span(text, alias, start, end):
+def ordinary_alias_span(text, alias, start, end):
     """Reject a common-noun occurrence without hiding other name occurrences."""
     if alias not in ('真理', '解真'):
         return False
@@ -180,7 +180,7 @@ def _ordinary_alias_span(text, alias, start, end):
                           text[:start]))
 
 
-def _embedded_group_name(text, end):
+def embedded_group_name(text, end):
     """A person alias inside a race/company name is not a named person.
 
     Check each occurrence independently: a later explicit mention of the
@@ -223,7 +223,7 @@ def _embedded_job_title(text, alias, end):
         r'喜欢|讨厌|认为|觉得|帮助|性格|经历|过去|后来|曾经|负责', compound.group())
 
 
-def _locative_event_title(alias, source_key=''):
+def locative_event_title(alias, source_key=''):
     """Very short record titles need an explicit story label, not bare 'in'."""
     return len(normalize(alias)) >= 3 or bool(re.match(r'^(?:act\d|main_)', source_key or ''))
 
@@ -235,7 +235,7 @@ def _explicit_event_reference(question, alias, source_key=''):
     if (re.search(r'[《“「]' + re.escape(alias) + r'[》”」]', question)
             or re.search(r'(?:活动|剧情|密录|故事|篇章)' + escaped, q)):
         return True
-    if not _locative_event_title(alias, source_key):
+    if not locative_event_title(alias, source_key):
         return False
     if _explicit_speaker_reference(question, alias):
         return True
@@ -259,21 +259,21 @@ def resolve_entity_resolution(db, question, previous_entities=()):
             continue
         spans = [(m.start(), m.end()) for m in re.finditer(re.escape(word), q)]
         spans = [(a,b) for a,b in spans if not any(x <= a and b <= y for x,y in matched_spans)]
-        spans = [(a,b) for a,b in spans if not _ordinary_alias_span(q, word, a, b)]
+        spans = [(a,b) for a,b in spans if not ordinary_alias_span(q, word, a, b)]
         if not spans:
             continue
         priority = max(row['priority'] for row in rows)
         best = list({row['entity_id']: row for row in rows if row['priority'] == priority}.values())
         row = best[0]
         if all(item['kind'] in ('character', 'machine', 'fan_machine', 'dialogue_speaker') for item in best):
-            spans = [(a, b) for a, b in spans if not _embedded_group_name(q, b)
+            spans = [(a, b) for a, b in spans if not embedded_group_name(q, b)
                      and not _embedded_job_title(q, word, b)]
             if not spans:
                 continue
         if row['kind'] == 'event' and len(word) <= 4:
             if not _explicit_event_reference(question, row['alias'], row.get('source_key', '')):
                 continue
-        if (row['kind'] == 'dialogue_speaker' and _generic_speaker_label(row['name'])
+        if (row['kind'] == 'dialogue_speaker' and generic_speaker_label(row['name'])
                 and not _explicit_speaker_reference(question, row['alias'])):
             continue
         if len(word)==1 and '\u3400' <= word <= '\u9fff':

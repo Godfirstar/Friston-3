@@ -8,15 +8,22 @@ class AutoPhotoSkill:
     """实时分析摄像头画面，构图稳定后倒计时拍照。"""
 
     name = "auto_photo"
+    description = "自动构图、倒计时拍照；可选整数countdown_seconds，1至10，默认3。"
 
-    parameters = {
-        "countdown_seconds": {
-            "type": int,
-            "default": 3,
-            "min": 1,
-            "max": 10
-        }
-    }
+    @staticmethod
+    def argument_schema():
+        return {"type": "object", "properties": {
+            "countdown_seconds": {"type": "integer", "minimum": 1, "maximum": 10}},
+            "required": [], "additionalProperties": False}
+
+    @staticmethod
+    def normalize_arguments(arguments, *, defaults=False):
+        if type(arguments) is not dict or set(arguments) - {"countdown_seconds"}:
+            raise ValueError("自动拍照只接受 countdown_seconds")
+        seconds = arguments.get("countdown_seconds", 3)
+        if type(seconds) is not int or not 1 <= seconds <= 10:
+            raise ValueError("countdown_seconds 必须为 1 至 10 的整数")
+        return {"countdown_seconds": seconds}
 
     def __init__(self, camera, observer):
         self.camera = camera

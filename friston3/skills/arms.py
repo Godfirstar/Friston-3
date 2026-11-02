@@ -4,24 +4,33 @@ import re
 
 class ArmsControlSkill:
     name = "control_arms"
-    operations = ("status", "list", "stop", "play")
+    operations = ("status", "list", "stop", "play", "task")
     description = (
-        "机械臂服务。operation必填：status查连接/任务，list列动作，stop停止并撤销使能，"
-        "play播放已示教name。仅play必填name，其余不带。"
-        "常用rest休息、wave挥手、welcome欢迎、point_pickup取物指示、shrug摊手；"
-        "须服务已使能且动作存在。使能/示教/自动开关/任意角度未开放。"
-        "明确机械臂操作用本技能，闲聊附带动作才用presentation.arm_gesture。"
+        'task取放：instruction照抄整句请求（物体/目的地/顺序），多步一次调用；arm可选。status查任务，list列示教，stop停止，play(name)播已使能的示教：rest/wave/welcome/point_pickup/shrug。结束≠抓取成功。'
     )
     def __init__(self, integration):
         self.integration = integration
 
     @classmethod
     def normalize_arguments(cls, arguments, *, defaults=False):
-        if type(arguments) is not dict or set(arguments) - {"operation", "name"}:
-            raise ValueError("机械臂操作只接受 operation 和 name")
+        if type(arguments) is not dict or set(arguments) - {"operation", "name", "instruction", "arm"}:
+            raise ValueError("机械臂操作只接受 operation、name、instruction 和 arm")
         operation = arguments.get("operation", "status" if defaults else None)
         if type(operation) is not str or operation not in cls.operations:
-            raise ValueError("机械臂只开放 status、list、stop 和 play")
+            raise ValueError("机械臂支持 status、list、stop、play 和 task")
+        if operation == "task":
+            if "name" in arguments:
+                raise ValueError("任务不接受已示教动作名")
+            instruction = arguments.get("instruction")
+            if type(instruction) is not str or not instruction.strip():
+                raise ValueError("任务需要完整的自然语言 instruction")
+            arm = arguments.get("arm")
+            if "arm" in arguments and arm not in ("left", "right"):
+                raise ValueError("arm 只能是 left 或 right")
+            return {"operation": operation, "instruction": instruction,
+                    **({"arm": arm} if arm is not None else {})}
+        if "instruction" in arguments or "arm" in arguments:
+            raise ValueError("只有 task 接受 instruction 和 arm")
         name = arguments.get("name", "")
         if operation == "play":
             if type(name) is not str or re.fullmatch(r"[a-z][a-z0-9_-]{0,47}", name) is None:
@@ -34,6 +43,11 @@ class ArmsControlSkill:
     def argument_schema(cls):
         return {"anyOf": [
             {"type": "object", "properties": {
+                "operation": {"type": "string", "enum": ["task"]},
+                "instruction": {"type": "string", "minLength": 1},
+                "arm": {"type": "string", "enum": ["left", "right"]}},
+             "required": ["operation", "instruction"], "additionalProperties": False},
+            {"type": "object", "properties": {
                 "operation": {"type": "string", "enum": ["status", "list", "stop"]}},
              "required": ["operation"], "additionalProperties": False},
             {"type": "object", "properties": {
@@ -43,5 +57,5 @@ class ArmsControlSkill:
              "required": ["operation", "name"], "additionalProperties": False},
         ]}
 
-    def execute(self, operation="status", name=""):
-        return self.integration.perform(operation, name=name)
+    def execute(self, operation="status", name="", instruction="", arm=None):
+        return self.integration.perform(operation, name=name, instruction=instruction, arm=arm)

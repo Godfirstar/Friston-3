@@ -108,3 +108,19 @@ def chunks(text, max_chars=420):
         part += sentence
     if part.strip():
         yield part.strip()
+
+
+def split_sentences(text):
+    return [part.strip() for part in re.findall(
+        r'[^。！？!?；;]+[。！？!?；;]+[”」』\"]*|[^。！？!?；;]+$', text) if part.strip()]
+
+
+def narrative_excerpt(text):
+    """Preserve factual narration and quotations under their source-owned label.
+
+    Quotation marks also wrap project names, and first-person words can occur in
+    third-person narration. Removing those entire sentences destroys evidence.
+    The enclosing evidence block carries the owner; quoted 'I' is source text,
+    never independent proof of the current speaker's memories.
+    """
+    return re.sub(r'\s+', ' ', str(text or '')).strip()

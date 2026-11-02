@@ -15,7 +15,7 @@ from .config import load_config
 
 _MAX_RESPONSE_BYTES = 256 * 1024
 _MAX_REQUEST_BYTES = 16 * 1024
-_OPERATIONS = frozenset(("arm", "stop", "auto", "play", "record", "list"))
+_OPERATIONS = frozenset(("arm", "stop", "auto", "play", "record", "list", "task", "shutdown"))
 _JOB_ID = re.compile(r"[A-Za-z0-9_-]{1,80}\Z")
 
 
@@ -52,6 +52,23 @@ class ArmClient:
 
     def status(self) -> dict[str, Any]:
         return self._request("GET", "/status")
+
+    def is_listening(self, *, timeout: float = 3.0) -> bool:
+        """Distinguish a closed port from HTTP timeout without sending a command.
+
+        Windows can take just over two seconds to report a refused loopback
+        connection. The short HTTP timeout is deliberately independent.
+        """
+        if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("端口探测 timeout 必须是有限正数")
+        try:
+            connection = socket.create_connection(("127.0.0.1", self.port), timeout=float(timeout))
+        except OSError as error:
+            if isinstance(error, ConnectionRefusedError) or error.errno in (61, 111, 10061):
+                return False
+            raise RuntimeError("机械臂服务端口监听状态未确认，未将超时当作服务退出。") from error
+        connection.close()
+        return True
 
     def job(self, job_id: str) -> dict[str, Any]:
         if not isinstance(job_id, str) or not _JOB_ID.fullmatch(job_id):

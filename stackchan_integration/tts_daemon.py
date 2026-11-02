@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 from .local_tts import OfflineCharacterVoice
+from .audio_protocol import MAX_PCM_BYTES, SAMPLE_WIDTH
 from .tts_export import split_text, synthesize_part
 
 
@@ -77,7 +78,7 @@ def serve() -> None:
                     cancelled = True
                     break
                 for chunk in segments:
-                    if not chunk or len(chunk) % 2 or len(chunk) > 384000:
+                    if not chunk or len(chunk) % SAMPLE_WIDTH or len(chunk) > MAX_PCM_BYTES:
                         raise ValueError("Unexpected PCM buffer size")
                     filename = out_dir / f"segment_{total:03d}.pcm"
                     filename.write_bytes(chunk)

@@ -4,7 +4,18 @@ class PhotoSkill:
     """普通单张拍照技能。"""
 
     name = "take_photo"
-    parameters = {}
+    description = "立即拍一张照片；arguments必须为{}。"
+
+    @staticmethod
+    def argument_schema():
+        return {"type": "object", "properties": {}, "required": [],
+                "additionalProperties": False}
+
+    @staticmethod
+    def normalize_arguments(arguments, *, defaults=False):
+        if type(arguments) is not dict or arguments:
+            raise ValueError("普通拍照不接受参数")
+        return {}
 
     def __init__(self, camera):
         self.camera = camera

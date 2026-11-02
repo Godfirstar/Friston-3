@@ -26,6 +26,9 @@ except ImportError:
 
 from .tcp_transport import TcpByteStream
 from .connection import WIFI_HOST, WIFI_PORT, preference_name, usb_candidates
+from .audio_protocol import (
+    MAX_PCM_BYTES, SAMPLE_RATE, pcm_seconds, validate_microphone, validate_pcm,
+)
 
 
 # Canonical IMA ADPCM step and index tables. Reset predictor/index each clip.
@@ -549,11 +552,8 @@ class StackChanBridge:
             # At all sensor protocol waits CANCEL is a text command. Sending it
             # releases a firmware MIC wait or DATA/ACK wait before reconnecting.
             # Never do this inside the legacy host-to-device AUDIO binary path.
-            if sent_command and self.transport == "serial" and self._serial is not None:
-                try:
-                    self._serial.write(b"CANCEL\n")
-                except Exception:
-                    pass
+            if sent_command and self.transport == "serial":
+                self.cancel_sensor()
             self.close()
             raise
 
@@ -573,23 +573,23 @@ class StackChanBridge:
         self._require_capability("CAMERA_JPEG_V1")
         self._exchange("CAMERA CLOSE", "OK CAMERA CLOSE", timeout=5.0)
 
+    def cancel_sensor(self) -> None:
+        """传感器失败后的尽力释放；音频上传的二进制阶段不能调用此方法。"""
+        if self._serial is not None:
+            try:
+                self._serial.write(b"CANCEL\n")
+            except Exception:
+                pass
+
     def record_pcm(self, mode: str = "touch", *, wait_ms: int = 1000,
                    max_ms: int = 8000, silence_ms: int = 700,
                    threshold: int = 350) -> bytes:
-        mode = str(mode).upper()
-        if mode not in ("TOUCH", "VAD"):
-            raise ValueError("Microphone mode must be 'touch' or 'vad'")
-        for name, value, low, high in (
-            ("wait_ms", wait_ms, 100, 10000), ("max_ms", max_ms, 1000, 12000),
-            ("silence_ms", silence_ms, 200, 2000), ("threshold", threshold, 30, 10000),
-        ):
-            if type(value) is not int or not low <= value <= high:
-                raise ValueError(f"{name} must be an integer in {low}..{high}")
+        mode = validate_microphone(mode, wait_ms, max_ms, silence_ms, threshold).upper()
         self._require_capability("MIC_PCM16_V1")
         self.last_mic_timing = {}
         pcm, timing = self._receive_blob(
             f"MIC {mode} {wait_ms} {max_ms} {silence_ms} {threshold}",
-            kind="PCM16", dimensions=(16000, 1), max_bytes=384000,
+            kind="PCM16", dimensions=(SAMPLE_RATE, 1), max_bytes=MAX_PCM_BYTES,
             header_timeout=(wait_ms + max_ms) / 1000.0 + 4.0,
         )
         self.last_mic_timing = timing
@@ -601,7 +601,7 @@ class StackChanBridge:
             raise ValueError("Volume must be an integer from 0 to 160")
         self._exchange(f"VOLUME {level}", f"OK VOLUME {level}")
 
-    def play_pcm(self, pcm: bytes, *, sample_rate: int = 16000) -> None:
+    def play_pcm(self, pcm: bytes, *, sample_rate: int = SAMPLE_RATE) -> None:
         """Upload and play <=12s PCM16LE mono with negotiated flow control.
 
         Only send 1024-byte packets when the firmware explicitly advertises
@@ -609,12 +609,9 @@ class StackChanBridge:
         their 128-byte handshake. Never infer a safe packet size from baudrate.
         """
         self.last_audio_timing = {}
-        if sample_rate != 16000:
+        if sample_rate != SAMPLE_RATE:
             raise ValueError("Expected 16000Hz PCM16LE mono audio")
-        if not isinstance(pcm, bytes):
-            raise TypeError("pcm must be bytes")
-        if not 2 <= len(pcm) <= 384000 or (len(pcm) & 1):
-            raise ValueError("PCM16 audio must be 0..12 seconds and even-sized")
+        validate_pcm(pcm)
         if self._serial is None or not self._serial.is_open:
             raise RuntimeError("StackChan not connected")
         info = self.info()
@@ -641,7 +638,7 @@ class StackChanBridge:
                     f"bytes (last confirmed {offset}): {exc}"
                 ) from exc
 
-        clip_duration = len(pcm) / 32000.0
+        clip_duration = pcm_seconds(len(pcm))
         self._expect_line("AUDIO STARTED", timeout=10.0)
         upload_seconds = time.perf_counter() - started_upload
         started_playback = time.perf_counter()

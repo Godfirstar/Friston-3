@@ -42,6 +42,16 @@ def _wait_seconds(value: str) -> float:
     return seconds
 
 
+def _task_wait_seconds(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("等待秒数必须是数字。") from error
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError("等待秒数必须是有限正数。")
+    return seconds
+
+
 def _shared_options(parser: argparse.ArgumentParser) -> None:
     # SUPPRESS lets both `--config X status` and `status --config X` work,
     # without a subparser default discarding a global option already supplied.
@@ -69,9 +79,13 @@ def _arguments(argv=None):
             ("status", "查看实际服务状态与当前姿态"),
             ("list", "列出已录制动作"),
             ("arm", "本地启用后续动作；不播放轨迹"),
-            ("stop", "请求停止并禁用后续动作；不卸力、不回起点")):
+            ("stop", "请求停止并禁用后续动作；不卸力、不回起点"),
+            ("shutdown", "停止任务并关闭服务，交还机械臂串口")):
         child = commands.add_parser(name, help=help_text)
         _shared_options(child)
+        if name == "shutdown":
+            child.add_argument("--no-wait", action="store_true", help="只显示关闭请求的接收结果")
+            child.add_argument("--wait-timeout", type=_task_wait_seconds, default=10.0)
 
     auto = commands.add_parser("auto", help="允许或禁止对话触发已录制的闭合动作")
     _shared_options(auto)
@@ -82,6 +96,15 @@ def _arguments(argv=None):
     play.add_argument("name", type=_motion_name)
     play.add_argument("--no-wait", action="store_true", help="只显示接收结果和任务编号")
     play.add_argument("--wait-timeout", type=_wait_seconds, default=45.0)
+
+    task = commands.add_parser("task", help="根据当前场景运行自然语言 Pi0.5 取放任务")
+    _shared_options(task)
+    task.add_argument("instruction", help="完整任务，例如：把红色积木放到蓝色盒子里")
+    task.add_argument("--arm", choices=("left", "right"), default=None,
+                      help="单臂配置自动选择；双臂配置请指定执行臂")
+    task.add_argument("--no-wait", action="store_true", help="只显示接收结果和任务编号")
+    task.add_argument("--wait-timeout", type=_task_wait_seconds, default=None,
+                      help="等待结果的秒数；默认持续等待，Ctrl+C 可停止任务")
 
     record = commands.add_parser("record", help="用主臂示教选定从臂，按实际反馈记录动作")
     _shared_options(record)
@@ -121,6 +144,14 @@ def _emit(result: dict, *, as_json: bool = False) -> None:
         print("当前任务：{name} / {status} / {id}".format(
             name=current.get("name", ""), status=current.get("status", ""),
             id=current.get("id", "")), flush=True)
+    for label, job in (("当前", current), ("上一项", result.get("last_job")),
+                       ("任务", finished_job)):
+        if isinstance(job, dict) and job.get("kind") == "task":
+            print(f"{label}策略任务：{job.get('instruction', '')}", flush=True)
+            print(f"  {job.get('policy_status', job.get('status', ''))}：{job.get('message', '')}", flush=True)
+            for key in ("scene", "metrics"):
+                if job.get(key):
+                    print(f"  {key}: " + json.dumps(job[key], ensure_ascii=False, allow_nan=False), flush=True)
     motions = result.get("motions")
     if isinstance(motions, list):
         if not motions:
@@ -195,14 +226,27 @@ def _stop_after_wait_failure(client: ArmClient) -> str:
         return "停止请求也未获得确认；请检查服务终端和机械臂当前状态。"
 
 
-def _wait_for_job(client: ArmClient, accepted: dict, *, timeout: float, as_json: bool) -> int:
+def _wait_for_shutdown(client: ArmClient, timeout: float):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if not client.is_listening(timeout=min(3.0, deadline - time.monotonic())):
+                return {"success": True, "status": "shutdown", "message": "机械臂服务已停止监听。"}
+        except (OSError, RuntimeError):
+            pass
+        time.sleep(0.1)
+    return {"success": False, "status": "shutdown_unconfirmed",
+            "message": "关闭请求已提交，但服务停止监听尚未确认。"}
+
+
+def _wait_for_job(client: ArmClient, accepted: dict, *, timeout: float | None, as_json: bool) -> int:
     job_id = accepted.get("job_id")
     if not isinstance(job_id, str) or not job_id:
         raise RuntimeError("服务接收了操作但未返回任务编号，不能确认执行结果。")
-    deadline = time.monotonic() + timeout
+    deadline = time.monotonic() + timeout if timeout is not None else None
     previous = None
     try:
-        while time.monotonic() < deadline:
+        while deadline is None or time.monotonic() < deadline:
             result = client.job(job_id)
             if result.get("success") is not True:
                 _emit(result, as_json=as_json)
@@ -255,6 +299,13 @@ def main(argv=None) -> int:
         elif args.operation == "play":
             motion_submitted = True
             result = client.command("play", name=args.name, source="manual")
+        elif args.operation == "task":
+            from .integration import ArmIntegration
+            motion_submitted = True
+            integration = ArmIntegration(args.config, notify=(lambda _: None) if args.json else None)
+            result = integration.perform("task", instruction=args.instruction, arm=args.arm)
+            # The independent service persists after this CLI exits. Closing
+            # this integration would cancel the task submitted with --no-wait.
         elif args.operation == "record":
             # Check availability before the preparation countdown. The service
             # remains authoritative if state changes while the operator waits.
@@ -285,7 +336,11 @@ def main(argv=None) -> int:
             confirmed = _confirm_stop(client)
             _emit(confirmed, as_json=args.json)
             return 0 if confirmed.get("success") is True else 1
-        if args.operation in ("record", "play") and not args.no_wait:
+        if args.operation == "shutdown" and not args.no_wait:
+            confirmed = _wait_for_shutdown(client, args.wait_timeout)
+            _emit(confirmed, as_json=args.json)
+            return 0 if confirmed.get("success") is True else 1
+        if args.operation in ("record", "play", "task") and not args.no_wait:
             return _wait_for_job(client, result, timeout=args.wait_timeout, as_json=args.json)
         return 0
     except KeyboardInterrupt:

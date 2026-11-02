@@ -10,6 +10,7 @@ import os
 import re
 import time
 from pathlib import Path
+from .audio_protocol import SAMPLE_RATE, MAX_PCM_BYTES
 
 BILINGUAL_MODEL_NAME = "kokoro-int8-multi-lang-v1_1"
 _NAME = re.compile(r"(?<![A-Za-z0-9_])(?:Friston|Frinston|Firston)[\s\-\u2011\u2013\u2014]*3(?![A-Za-z0-9_])", re.I)
@@ -105,7 +106,7 @@ class OfflineCharacterVoice:
         count = count() if callable(count) else count
         if isinstance(count, int) and not self.speaker < count:
             raise ValueError("模型不含既定 58 号音色；请安装 Kokoro v1.1 中英 int8 包")
-        self._colour_filter = signal.butter(2, (100, 4700), btype="bandpass", fs=16000, output="sos")
+        self._colour_filter = signal.butter(2, (100, 4700), btype="bandpass", fs=SAMPLE_RATE, output="sos")
         self.last_synthesis_timing: dict[str, float] = {}
 
     def prepare_text(self, text: str) -> str:
@@ -134,11 +135,11 @@ class OfflineCharacterVoice:
             raise RuntimeError("TTS did not produce valid mono audio")
         if not self._np.all(self._np.isfinite(samples)):
             raise RuntimeError("TTS produced invalid sample values")
-        if rate != 16000:
-            common = math.gcd(rate, 16000)
-            samples = self._signal.resample_poly(samples, 16000 // common, rate // common)
+        if rate != SAMPLE_RATE:
+            common = math.gcd(rate, SAMPLE_RATE)
+            samples = self._signal.resample_poly(samples, SAMPLE_RATE // common, rate // common)
         coloured = self._signal.sosfilt(self._colour_filter, samples)
-        carrier = self._np.sin(2.0 * self._np.pi * 46.0 * self._np.arange(len(samples)) / 16000.0)
+        carrier = self._np.sin(2.0 * self._np.pi * 46.0 * self._np.arange(len(samples)) / SAMPLE_RATE)
         samples = (1.0 - self.fx_mix) * samples + self.fx_mix * coloured * carrier
         peak = float(self._np.max(self._np.abs(samples)))
         if peak > 1e-4:
@@ -176,7 +177,7 @@ class OfflineCharacterVoice:
         """
         pcm = self._synthesize_pcm(text)
         result = []
-        while len(pcm) > 384000:
+        while len(pcm) > MAX_PCM_BYTES:
             values = self._np.frombuffer(pcm, dtype="<i2")
             # Find the quietest 10-ms window in the last 1.5 seconds permitted.
             start, end, window = 168000, 191840, 160

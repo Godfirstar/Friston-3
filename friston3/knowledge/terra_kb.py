@@ -14,7 +14,10 @@ from friston3.config import KNOWLEDGE_DB, LORE_WIKI_SOURCE
 from friston3.knowledge.entity_resolver import resolve_entities, resolve_entity_resolution
 from friston3.knowledge.import_lore_wiki import import_lore_wiki
 from friston3.knowledge.lore_schema import DDL, DB_VERSION
-from friston3.knowledge.retrieve_lore import build_evidence_packet, detect_intent, get_card, ranked_search
+from friston3.knowledge.retrieve_lore import build_evidence_packet
+from friston3.knowledge.lore_search import get_card, ranked_search
+from friston3.knowledge.hybrid_search import hybrid_ranked_search
+from friston3.knowledge.retrieval_policy import SearchRequest, detect_intent, find_entity
 from friston3.npc.identity import IDENTITY
 
 DEFAULT_SOURCE = LORE_WIKI_SOURCE
@@ -69,73 +72,40 @@ def connect(db_file=KNOWLEDGE_DB):
     return db
 
 
-def _row_entity(db, entity_id):
-    row = db.execute('SELECT * FROM entities WHERE id=?', (entity_id,)).fetchone()
-    return dict(row) if row else None
+def retrieve_packet(question, *, resolution=None, search_query=None, intent=None,
+                    db_file=KNOWLEDGE_DB, max_chars=2500):
+    """Retrieve evidence for one resolved task, optionally using a new search query.
 
-
-def retrieve_packet(question, *, previous_entities=(), retrieval_question=None,
-                    resolved_question=None, subject_ids=None, intent=None,
-                    db_file=KNOWLEDGE_DB, max_chars=2500, **_compat):
+    Dialogue supplies its SQLite entity resolution. Standalone callers can omit
+    it to resolve ``question`` here. Raw user text stays with the dialogue turn.
+    """
     if not isinstance(question, str) or not question.strip():
         return {'context': '', 'intent': 'general', 'entity_ids': [], 'subjects': [], 'sources': [],
                 'resolution': {'status': 'unknown', 'entity_ids': [], 'mentions': [],
                                'ambiguities': [], 'used_previous': False}}
     with closing(connect(db_file)) as db:
-        # The caller supplies one contextualized task to resolution and search.
-        # Original user text remains available for attribution and diagnostics.
-        task = resolved_question if isinstance(resolved_question, str) and resolved_question.strip() else question
-        resolution = resolve_entity_resolution(db, task, previous_entities)
-        ids = list(resolution['entity_ids'])
-        if subject_ids is not None and resolution['status'] != 'ambiguous':
-            # IDs come from the caller's SQLite resolution, never raw model text.
-            ids = [entity_id for entity_id in dict.fromkeys(subject_ids)
-                   if isinstance(entity_id, str) and _row_entity(db, entity_id)][:8]
-            if ids:
-                resolution = {**resolution, 'entity_ids': ids, 'status': 'resolved',
-                              'unresolved_reference': False}
-        query = retrieval_question if isinstance(retrieval_question, str) and retrieval_question.strip() else question
+        resolution = dict(resolution) if resolution is not None else resolve_entity_resolution(db, question)
+        # Keep only IDs present in this snapshot; a model response is never an ID authority.
+        ids = [entity_id for entity_id in dict.fromkeys(resolution['entity_ids'])
+               if isinstance(entity_id, str) and find_entity(db, entity_id)][:8]
+        resolution['entity_ids'] = ids
+        query = search_query if search_query is not None else question
         if resolution['status'] == 'ambiguous' or resolution.get('unresolved_reference'):
             return {'context': '', 'intent': intent or detect_intent(query), 'entity_ids': ids,
                     'subjects': [{key: row[key] for key in ('id', 'name', 'kind', 'scope')}
-                                 for entity_id in ids if (row := _row_entity(db, entity_id))],
+                                 for entity_id in ids if (row := find_entity(db, entity_id))],
                     'sources': [], 'resolution': resolution}
         packet = build_evidence_packet(db, query, ids, max_chars=max_chars, intent=intent)
         packet['original_question'] = question
-        packet['resolved_question'] = task
+        packet['resolved_question'] = question
         packet['entity_ids'] = ids
         packet['resolution'] = {**resolution, 'entity_ids': list(ids)}
         if IDENTITY.entity_id in ids and len(ids) >= 2 and not packet['sources']:
             others = [entity_id for entity_id in ids if entity_id != IDENTITY.entity_id]
-            names = [row['name'] for entity_id in others if (row := _row_entity(db, entity_id))]
+            names = [row['name'] for entity_id in others if (row := find_entity(db, entity_id))]
             overview = build_evidence_packet(db, '介绍' + '、'.join(names), others, max_chars=700)
             packet['target_overviews'] = [source for source in overview['sources'] if source['kind'] == 'overview']
         return packet
-
-
-def retrieve_context(question, **kwargs):
-    packet = retrieve_packet(question, **kwargs)
-    return packet['context'], packet['entity_ids']
-
-
-def context_for(question, limit=2):
-    return retrieve_context(question, max_relations=limit)[0]
-
-
-def search_passages(query, *, db=None, db_file=KNOWLEDGE_DB, limit=3, kinds=None, focus_names=()):
-    owns = db is None
-    db = db or connect(db_file)
-    try:
-        resolution = resolve_entity_resolution(db, query)
-        if resolution['status'] == 'ambiguous':
-            return []
-        ids = list(resolution['entity_ids'])
-        for name in focus_names:
-            ids.extend(i for i in resolve_entities(db, name) if i not in ids)
-        return ranked_search(db, query, ids=ids, limit=limit, kinds=kinds)
-    finally:
-        if owns:
-            db.close()
 
 
 def reply_entity_mentions(reply, *, db_file=KNOWLEDGE_DB):
@@ -144,16 +114,9 @@ def reply_entity_mentions(reply, *, db_file=KNOWLEDGE_DB):
                 for entity_id in resolve_entities(db, reply)
                 # Name resolution already checks short aliases in context.
                 # Do not discard a resolved one-character character name.
-                if (entity := _row_entity(db, entity_id))
+                if (entity := find_entity(db, entity_id))
                 and entity['name'] in reply
                 and entity['kind'] in ('character', 'machine', 'fan_machine', 'dialogue_speaker')]
-
-
-def lookup(question, limit=3, *, db_file=KNOWLEDGE_DB, **_compat):
-    with closing(connect(db_file)) as db:
-        return [{'id': e['id'], 'fact': e['summary'], 'kind': '项目设定' if e['scope']=='fan' else 'Wiki二次总结',
-                 'source': e['source']} for i in resolve_entities(db, question)[:limit]
-                if (e := _row_entity(db, i))]
 
 
 def stats(db_file=KNOWLEDGE_DB):
@@ -194,7 +157,7 @@ def network(query, *, db_file=KNOWLEDGE_DB, depth=1, limit=30):
                         queue.append((target, distance+1))
         return {'roots': roots, 'depth': depth, 'truncated': truncated,
                 'note': '箭头表示资料页面主体到关系对象；多跳路径不推导人物关系。Wiki为未人工核验的二次总结。',
-                'nodes': [_row_entity(db, i) for i in sorted(visited)], 'edges': list(edges.values())}
+                'nodes': [find_entity(db, i) for i in sorted(visited)], 'edges': list(edges.values())}
 
 
 def main(argv=None):
@@ -230,10 +193,20 @@ def main(argv=None):
                     WHERE ({where}) ORDER BY r.id LIMIT ?''', (*ids, *ids, min(500, max(1, args.limit))))]
             else:
                 result = get_card(db, ids[0], max_sections=min(10, max(1, args.limit)))
-    elif args.operation == 'search':
+    elif args.operation in ('search', 'hybrid'):
         if not query:
-            parser.error('search 后请写关键词')
-        result = search_passages(query, limit=min(30, max(1, args.limit)))
+            parser.error('search/hybrid 后请写关键词')
+        with closing(connect()) as db:
+            resolution = resolve_entity_resolution(db, query)
+            if resolution['status'] == 'ambiguous':
+                result = []
+            else:
+                request = SearchRequest(db, query, resolution['entity_ids'])
+                if args.operation == 'hybrid':
+                    result = hybrid_ranked_search(db, request, limit=args.limit,
+                                kinds=('profile', 'character', 'event', 'project'))
+                else:
+                    result = ranked_search(db, request, limit=args.limit)
     else:
         result = retrieve_packet(' '.join([args.operation, *args.question]))
     content = json.dumps(result, ensure_ascii=False, indent=2)

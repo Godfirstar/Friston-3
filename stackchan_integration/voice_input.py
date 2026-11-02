@@ -50,7 +50,7 @@ class StackChanSpeechInput:
     def __init__(self, face: StackChanFaceEvents):
         self.face = face
         self.mode = SETTINGS.get("mic_mode", "touch")
-        self.max_ms, self.silence_ms, self.threshold = 8000, 700, 350
+        self.max_ms, self.silence_ms, self.threshold = 8000, 700, 100
         self.num_threads = 2
         self.model_dir = seaco_model_dir()
         self._device_epoch = None

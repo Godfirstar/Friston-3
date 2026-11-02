@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Optional
 
 from .face_events import StackChanFaceEvents
+from .audio_protocol import MAX_PCM_BYTES, pcm_seconds
 from friston3.runtime_settings import SETTINGS
 from friston3.runtime_bootstrap import interpreter_environment
 
@@ -119,7 +120,31 @@ class AgentSpeechOutput:
             target=reader, daemon=True, name="friston-tts-output"
         ).start()
 
-    def speak(self, reply: str) -> bool:
+    def speak(self, reply: str, *, on_start=None) -> bool:
+        """Notify once before first PCM dispatch, or on text-only fallback.
+
+        Optional presentation callbacks must not block audio. Callback failure
+        is isolated from speech, and multi-clip replies cannot replay it.
+        """
+        notified = False
+
+        def start_once():
+            nonlocal notified
+            if notified:
+                return
+            notified = True
+            if callable(on_start):
+                try:
+                    on_start()
+                except Exception as error:
+                    print(f"[StackChanTTS] 附带动作未启动，播音继续：{error}")
+
+        try:
+            return self._speak(reply, on_start=start_once)
+        finally:
+            start_once()
+
+    def _speak(self, reply: str, *, on_start) -> bool:
         """Speak NPC text, batching adjacent clips into <=12s PCM commands.
 
         The TTS daemon synthesizes chunks in a persistent subprocess and emits
@@ -157,7 +182,7 @@ class AgentSpeechOutput:
                     )
                     self._proc.stdin.flush()
 
-                    max_pcm_bytes = 384000  # 12 seconds, mono PCM16LE/16kHz
+                    max_pcm_bytes = MAX_PCM_BYTES
                     prefetch = 0.08
                     segments_seen = 0
                     clips_played = 0
@@ -185,7 +210,7 @@ class AgentSpeechOutput:
                             first_ready_at = None
                             return
                         combined = b"".join(waiting_pcm)
-                        seconds = len(combined) / 32000.0
+                        seconds = pcm_seconds(len(combined))
                         print(
                             f"[StackChanTTS] 合并 {waiting_segments} 段 → "
                             f"播放第 {clips_played + 1} 条音频（{seconds:.2f}s）；"
@@ -193,6 +218,7 @@ class AgentSpeechOutput:
                         )
                         began = time.perf_counter()
                         try:
+                            on_start()
                             self.face.play_pcm(combined, volume=self.volume,
                                                session_epoch=playback_epoch)
                         except (ConnectionError, TimeoutError) as error:
@@ -305,7 +331,7 @@ class AgentSpeechOutput:
                         if not raw_pcm or len(raw_pcm) > max_pcm_bytes or len(raw_pcm) % 2:
                             raise RuntimeError("Invalid 16kHz PCM16 segment")
 
-                        seconds = len(raw_pcm) / 32000.0
+                        seconds = pcm_seconds(len(raw_pcm))
                         segments_seen += 1
                         ready_s = max(0.0, float(ev.get("received_at", time.perf_counter())) - start)
                         if first_segment_s is None:

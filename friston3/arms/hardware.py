@@ -260,7 +260,7 @@ class _OwnedDriver:
         if not self._connected:
             raise RuntimeError("机械臂驱动尚未连接。")
 
-    def _targets(self, targets: Any) -> dict[str, dict[str, float]]:
+    def _targets(self, targets: Any, *, native_policy: bool = False) -> dict[str, dict[str, float]]:
         self._require_connected()
         if not isinstance(targets, Mapping) or not targets or not set(targets) <= set(self._profiles):
             raise ValueError("目标必须指定至少一只已连接机械臂。")
@@ -268,7 +268,8 @@ class _OwnedDriver:
         for arm in ARM_NAMES:
             if arm in targets:
                 checked[arm] = _positions(targets[arm], arm)
-                _check_limits(checked[arm], self._profiles[arm]["limits"], arm)
+                if not native_policy:
+                    _check_limits(checked[arm], self._profiles[arm]["limits"], arm)
         return checked
 
 
@@ -306,7 +307,7 @@ class RealHardware(_OwnedDriver):
             _close_without_release(device)
             raise
 
-    def connect(self) -> None:
+    def connect(self, *, native_policy: bool = False) -> None:
         self._claim()
         if self._connected or self._devices:
             raise RuntimeError("机械臂驱动已有连接；请先关闭现有连接。")
@@ -325,7 +326,8 @@ class RealHardware(_OwnedDriver):
                         "请用原 LeRobot 流程检查，服务不会写回标定。"
                     )
                 initial = _positions(device.get_observation(), arm)
-                _check_limits(initial, profiles[arm]["limits"], arm)
+                if not native_policy:
+                    _check_limits(initial, profiles[arm]["limits"], arm)
             self._profiles = profiles
             self._connected = True
         except BaseException as original:
@@ -346,6 +348,20 @@ class RealHardware(_OwnedDriver):
             arm: _positions(self._devices[arm].send_action(values), f"{arm} 下发结果")
             for arm, values in checked.items()
         }
+
+    def send_policy(self, targets: Any) -> dict[str, dict[str, float]]:
+        """Use the installed SDK's native target semantics for policy commands."""
+        checked = self._targets(targets, native_policy=True)
+        result = {}
+        for arm, values in checked.items():
+            device = self._devices[arm]
+            previous = device.config.max_relative_target
+            device.config.max_relative_target = None
+            try:
+                result[arm] = _positions(device.send_action(values), f"{arm} 下发结果")
+            finally:
+                device.config.max_relative_target = previous
+        return result
 
     def connect_leader(self) -> None:
         self._require_connected()
@@ -416,7 +432,7 @@ class MockHardware(_OwnedDriver):
         self._state: dict[str, dict[str, float]] = {}
         self._leader_start: float | None = None
 
-    def connect(self) -> None:
+    def connect(self, *, native_policy: bool = False) -> None:
         self._claim()
         if self._connected:
             raise RuntimeError("mock 驱动已连接。")
@@ -450,6 +466,12 @@ class MockHardware(_OwnedDriver):
             self._state[arm] = applied
             result[arm] = dict(applied)
         return result
+
+    def send_policy(self, targets: Any) -> dict[str, dict[str, float]]:
+        checked = self._targets(targets, native_policy=True)
+        for arm, values in checked.items():
+            self._state[arm] = dict(values)
+        return copy.deepcopy(checked)
 
     def connect_leader(self) -> None:
         self._require_connected()

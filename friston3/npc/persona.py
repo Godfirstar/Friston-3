@@ -5,6 +5,7 @@ from functools import lru_cache
 from friston3.config import PROJECT_ROOT
 from friston3.npc.dialogue import conversation_act
 from friston3.npc.identity import IDENTITY
+from friston3.arms.config import GESTURES as ARM_GESTURES
 
 
 _VOICE_PROMPT = f"""你是《明日方舟》的{IDENTITY.name}，自称{IDENTITY.self_name}，以沉稳、阅历感和干燥幽默陪主人逛漫展。说平实口语，态度有主见、亲近而不撒娇；被夸自然接受，认真时简洁笃定。嘴硬是先轻微自嘲再认真关心，偶尔一本正经地调侃处境，绝不挖苦游客、训话或否定对方感受。对主人有搭档默契，对游客友好接话。
@@ -21,11 +22,13 @@ PRESENTATION_GESTURES = (
     "proud", "chuckle", "surprised", "concerned", "bow", "look_owner",
     "look_left", "look_right", "scan",
 )
+PRESENTATION_ARM_GESTURES = ("none", *ARM_GESTURES)
 PRESENTATION_SCHEMA = {
     "type": "object", "properties": {
         "emotion": {"type": "string", "enum": list(PRESENTATION_EMOTIONS)},
         "gesture": {"type": "string", "enum": list(PRESENTATION_GESTURES)},
-    }, "required": ["emotion", "gesture"], "additionalProperties": False,
+        "arm_gesture": {"type": "string", "enum": list(PRESENTATION_ARM_GESTURES)},
+    }, "required": ["emotion", "gesture", "arm_gesture"], "additionalProperties": False,
 }
 _GESTURE_PROMPT = (
     "gesture通常auto，由设备按本句情绪编排；本轮明确不动用none，明确要求某预设就选它。"
@@ -34,15 +37,19 @@ _GESTURE_PROMPT = (
     "look_owner朝主人、look_left向左、look_right向右、scan短暂环顾。两轴不能横滚侧歪，左右按机器人视角。"
     "一轮一个主预设，沉稳有停顿；不填角度/速度、不写动作旁白、不声称已执行。"
 )
+_ARM_GESTURE_PROMPT = (
+    "arm_gesture通常none；可选rest休息、wave挥手、welcome欢迎、point_pickup指示取物区、shrug摊手，"
+    "仅附带已示教动作。明确不动时两种gesture均none；不据提示声称执行或递物。"
+)
 PRESENTATION_PROMPT = (
-    "presentation选本句表情和头部预设，不能代替回答或证明动作已执行。"
+    "presentation选本句表情、头部和可选机械臂提示，不能代替回答或证明动作已执行。"
     "emotion：neutral平静、warm亲近、amused会意、proud自豪、thinking思索、curious好奇、"
     "surprised惊讶、concerned关切、sad低落、firm认真、sleepy困倦演出（不表示电量）。"
-    + _GESTURE_PROMPT
+    + _GESTURE_PROMPT + _ARM_GESTURE_PROMPT
 )
 PRESENTATION_ROUTE_PROMPT = (
-    "presentation按本句选emotion。" + _GESTURE_PROMPT +
-    "仅CHAT选择；其他route固定neutral和none。"
+    "presentation按本句选emotion。" + _GESTURE_PROMPT + _ARM_GESTURE_PROMPT +
+    "仅CHAT选择；其他route固定emotion=neutral、gesture=none、arm_gesture=none。"
 )
 
 
@@ -50,9 +57,11 @@ def normalize_presentation(value=None):
     """Bad advisory fields never break a valid reply or become actuator data."""
     value = value if isinstance(value, dict) else {}
     emotion, gesture = value.get("emotion"), value.get("gesture")
+    arm_gesture = value.get("arm_gesture")
     return {
         "emotion": emotion if isinstance(emotion, str) and emotion in PRESENTATION_EMOTIONS else "neutral",
         "gesture": gesture if isinstance(gesture, str) and gesture in PRESENTATION_GESTURES else "none",
+        "arm_gesture": arm_gesture if isinstance(arm_gesture, str) and arm_gesture in PRESENTATION_ARM_GESTURES else "none",
     }
 
 

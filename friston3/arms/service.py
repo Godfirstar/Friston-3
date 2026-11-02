@@ -42,6 +42,9 @@ class ArmService:
         self._auto = False
         self._positions = {}
         self._profiles = {}
+        # A reconnect may observe a pose left by native policy execution.
+        # Each legacy job re-enters its original rules for its own arms only.
+        self._native_policy_arms = set(config["arms"])
         self._observed_at = 0.0
         self._active = None
         self._last_job = None
@@ -50,6 +53,8 @@ class ArmService:
         self._generation = 0
         self._need_hold = False
         self._hold_result = None
+        self._policy = None
+        self._shutdown_requested = False
         self._motions, self._invalid = motion_catalog(config)
 
     def start(self):
@@ -70,17 +75,21 @@ class ArmService:
             return None
         return deepcopy({key: job[key] for key in (
             "id", "kind", "name", "status", "message", "source", "elapsed_s",
-            "duration_s", "hold_confirmed", "motion_saved", "limited", "arms") if key in job})
+            "duration_s", "hold_confirmed", "motion_saved", "limited", "arms",
+            "instruction", "policy_status", "metrics", "scene", "task_success", "verification",
+            "object_task_success_verified") if key in job})
 
     def status(self):
         with self._lock:
-            status = ("faulted" if self._fault else "starting" if not self._ready else
+            status = ("shutting_down" if self._shutdown_requested else "faulted" if self._fault else "starting" if not self._ready else
                       "stopping" if self._need_hold else
                       self._active["status"] if self._active else "idle")
             return _result(not bool(self._fault), status,
                 self._fault or ("模拟服务：不会控制真实机械臂。" if self.config["mode"] == "mock" else
                                  "机械臂服务已连接。" if self._ready else "正在连接机械臂。"),
                 mode=self.config["mode"], armed=self._armed, auto_enabled=self._auto,
+                policy_resident=(self._policy is not None or
+                                 bool(self._active and self._active["kind"] == "task")),
                 busy=self._active is not None or self._need_hold,
                 ready=self._ready, stop_pending=self._need_hold,
                 available_arms=list(self._profiles) if self._ready else [],
@@ -128,7 +137,8 @@ class ArmService:
         fields = {
             "arm": set(), "stop": {"job_id"}, "auto": {"enabled"},
             "play": {"name", "source"}, "record": {"name", "arm", "duration_s"},
-            "list": set(), "status": set(),
+            "task": {"instruction", "arm"},
+            "list": set(), "status": set(), "shutdown": set(),
         }
         if operation not in fields or set(request) - {"op", "request_id"} - fields[operation]:
             raise ValueError("未知操作或多余参数")
@@ -138,6 +148,11 @@ class ArmService:
             self._motions, self._invalid = motion_catalog(self.config)
             return _result(True, "listed", "已读取本地示教动作。", mode=self.config["mode"],
                            motions=deepcopy(self._motions), invalid_motions=deepcopy(self._invalid))
+        if operation == "shutdown":
+            self._shutdown_requested = True
+            self._request_stop_locked()
+            return _result(True, "shutting_down", "服务关闭请求已接收；停止当前任务后断开机械臂串口。",
+                           mode=self.config["mode"])
         if operation == "stop":
             specified = request.get("job_id")
             if specified is not None:
@@ -146,6 +161,8 @@ class ArmService:
                 if not self._active or self._active["id"] != specified:
                     return _result(True, "no_op", "该任务已不在执行；未干预其他任务。")
             return self._request_stop_locked()
+        if self._shutdown_requested:
+            raise ValueError("机械臂服务正在关闭")
         if not self._ready or self._fault or self._closing.is_set():
             raise ValueError(self._fault or "机械臂尚未准备好")
         if self._need_hold:
@@ -166,19 +183,33 @@ class ArmService:
             if not enabled and self._active and self._active.get("source") == "dialogue":
                 return self._request_stop_locked()
             return _result(True, "configured", "自动对话动作已" + ("开启。" if enabled else "关闭。"))
-        if not self._armed:
+        if operation != "task" and not self._armed:
             raise ValueError("动作未使能；在机械臂终端运行 python -m friston3.arms arm")
         if self._active:
             return _result(False, "busy", "机械臂正在执行任务，本次动作未排队。",
                            job_id=self._active["id"])
-        name = validate_name(request.get("name"))
+        if operation == "task":
+            instruction = request.get("instruction")
+            if not isinstance(instruction, str) or not instruction.strip():
+                raise ValueError("任务需要完整的自然语言 instruction")
+            arm = request.get("arm")
+            if arm is None and len(self.config["arms"]) == 1:
+                arm = next(iter(self.config["arms"]))
+            if arm not in self.config["arms"]:
+                raise ValueError("请用 arm 指定执行任务的已配置机械臂：" + "、".join(self.config["arms"]))
+            name = "policy_task"
+        else:
+            name = validate_name(request.get("name"))
         now = time.monotonic()
         if now - self._observed_at > max(0.5, 3.0 / self.config["fps"]):
             raise ValueError("机械臂状态过旧，拒绝开始动作")
         job = {"id": uuid.uuid4().hex, "kind": operation, "name": name,
                "status": "accepted", "message": "任务已接收，尚未完成。", "source": "manual",
                "generation": self._generation, "accepted_at": now, "elapsed_s": 0.0}
-        if operation == "play":
+        if operation == "task":
+            job.update(instruction=instruction, arm=arm, arms=[arm],
+                       object_task_success_verified=False)
+        elif operation == "play":
             source = request.get("source", "manual")
             if source not in ("manual", "dialogue"):
                 raise ValueError("source 只支持 manual 或 dialogue")
@@ -204,7 +235,15 @@ class ArmService:
             if (Path(self.config["motions_dir"]) / (name + ".json")).exists():
                 raise ValueError("同名动作已存在，未覆盖；请换一个名称或先手动备份并移走旧文件")
             job.update(arm=arm, arms=[arm], duration_s=float(duration), frames=[], limited=False)
-            self._auto = False
+        if operation == "task":
+            self._native_policy_arms.add(arm)
+        else:
+            try:
+                self._validate_legacy_positions(self._positions, job["arms"])
+            except RuntimeError as error:
+                raise ValueError(str(error)) from error
+            if operation == "record":
+                self._auto = False
         self._active = job
         self._jobs[job["id"]] = job
         while len(self._jobs) > 64:
@@ -232,6 +271,13 @@ class ArmService:
         return _result(True, "stop_requested", "停止请求已接收；未回起点、未卸力，等待执行器确认持姿。",
                        hold_confirmed=False)
 
+    def _validate_legacy_positions(self, positions, arms):
+        for arm in arms:
+            for joint, number in positions[arm].items():
+                low, high = self._profiles[arm]["limits"][joint]
+                if not low - 0.01 <= number <= high + 0.01:
+                    raise RuntimeError(f"{arm}.{joint} 实测超出已标定范围")
+
     def _observe(self):
         positions = self.hardware.read()
         if set(positions) != set(self.config["arms"]):
@@ -240,10 +286,9 @@ class ArmService:
             if (set(pose) != set(JOINTS) or any(type(v) not in (int, float) or not math.isfinite(v)
                                               for v in pose.values())):
                 raise RuntimeError(f"{arm} 状态包含无效关节数值")
-            for joint, number in pose.items():
-                low, high = self._profiles[arm]["limits"][joint]
-                if not low - 0.01 <= number <= high + 0.01:
-                    raise RuntimeError(f"{arm}.{joint} 实测超出已标定范围")
+        with self._lock:
+            legacy_arms = set(positions) - self._native_policy_arms
+        self._validate_legacy_positions(positions, legacy_arms)
         with self._lock:
             self._positions = positions
             self._observed_at = time.monotonic()
@@ -260,13 +305,22 @@ class ArmService:
     def _hold(self):
         # Called only by the serial owner; no stale cached pose is substituted.
         positions = self._observe()
-        self.hardware.send(positions)
+        with self._lock:
+            native = {arm: pose for arm, pose in positions.items() if arm in self._native_policy_arms}
+            legacy = {arm: pose for arm, pose in positions.items() if arm not in self._native_policy_arms}
+        if native:
+            self.hardware.send_policy(native)
+        if legacy:
+            self.hardware.send(legacy)
         return _result(True, "hold_command_sent", "已用当前实测姿态下发持姿目标；持续监控连接。",
                        hold_confirmed=True)
 
     def _cancel_current(self):
         with self._lock:
             job = self._active
+        if job and job["kind"] == "task" and self._policy is not None:
+            self._policy.stop()
+            self._update_policy_job(job)
         try:
             result = self._hold()
         except Exception as error:
@@ -290,6 +344,19 @@ class ArmService:
         with self._lock:
             if self._cancel.is_set() or job["generation"] != self._generation or self._closing.is_set():
                 return
+        if job["kind"] == "task":
+            if self._policy is None:
+                from .policy import PolicySession
+                self._policy = PolicySession(self.config)
+            self._policy.start(job["instruction"], job["arm"], deepcopy(positions[job["arm"]]))
+            with self._lock:
+                job["started_at"] = time.monotonic()
+                job.update(status="running", message="任务正在加载策略与场景；尚未确认取物结果。")
+            self._update_policy_job(job)
+            return
+        self._validate_legacy_positions(positions, job["arms"])
+        with self._lock:
+            self._native_policy_arms.difference_update(job["arms"])
         if job["kind"] == "record":
             self.hardware.connect_leader()
             leader_start = self.hardware.read_leader()
@@ -312,6 +379,43 @@ class ArmService:
             job.update(status="running", message=message)
         print(f"[Arms] {job['name']}: running ({job['duration_s']:g}s)", flush=True)
 
+    def _update_policy_job(self, job):
+        snapshot = self._policy.status()
+        with self._lock:
+            for key in ("metrics", "scene", "instruction", "task_success", "verification"):
+                if key in snapshot:
+                    job[key] = deepcopy(snapshot[key])
+            job["policy_status"] = snapshot.get("status", "running")
+            if snapshot.get("message"):
+                job["message"] = str(snapshot["message"])
+        return snapshot
+
+    def _tick_policy_job(self, job, positions):
+        if self._cancel.is_set() or job["generation"] != self._generation or self._closing.is_set():
+            return
+        target = self._policy.tick(deepcopy(positions[job["arm"]]))
+        self._update_policy_job(job)
+        if self._cancel.is_set() or job["generation"] != self._generation or self._closing.is_set():
+            return
+        if target is not None:
+            applied = self.hardware.send_policy({job["arm"]: target})
+            self._policy.acknowledge(applied[job["arm"]])
+        snapshot = self._update_policy_job(job)
+        with self._lock:
+            job["elapsed_s"] = round(time.monotonic() - job["started_at"], 3)
+            if self._cancel.is_set() or job["generation"] != self._generation or self._closing.is_set():
+                return
+        state = snapshot.get("status", "running")
+        if state == "failed":
+            raise RuntimeError(snapshot.get("message") or "策略执行失败")
+        if state in ("completed", "cancelled"):
+            message = (str(snapshot.get("message") or "策略执行周期已结束；物体是否成功取放尚未确认。")
+                       if state == "completed" else str(snapshot.get("message") or "策略任务已取消。"))
+            self._finish(job, state, message, object_task_success_verified=False)
+        else:
+            with self._lock:
+                job["status"] = "loading" if state == "loading" else "running"
+
     def _bounded_reference(self, job, target, dt):
         answer = {}
         for arm, pose in target.items():
@@ -330,6 +434,9 @@ class ArmService:
     def _tick_job(self, job, positions):
         if job["status"] == "accepted":
             self._start_job(job, positions)
+            return
+        if job["kind"] == "task":
+            self._tick_policy_job(job, positions)
             return
         if job["status"] != "running":
             return
@@ -426,6 +533,8 @@ class ArmService:
 
     def _job_failed(self, job, error):
         message = f"{type(error).__name__}: {error}"
+        if job["kind"] == "task" and self._policy is not None:
+            self._policy.stop()
         with self._lock:
             self._armed = self._auto = False
             self._cancel.set()
@@ -447,7 +556,7 @@ class ArmService:
     def _run(self):
         connected = False
         try:
-            self.hardware.connect()
+            self.hardware.connect(native_policy=True)
             connected = True
             self._profiles = deepcopy(self.hardware.profiles)
             self._observe()
@@ -484,6 +593,12 @@ class ArmService:
             print(f"[Arms] 服务故障：{self._fault}", flush=True)
         finally:
             self._startup.set()
+            if self._policy is not None:
+                try:
+                    self._policy.stop()
+                    self._policy.close()
+                except Exception as error:
+                    print(f"[Arms] 策略关闭未确认：{error}", flush=True)
             # Final readback hold is attempted only after a completed connect;
             # the driver closes all ports without a surprise torque release.
             if connected:
@@ -580,11 +695,25 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(_result(False, "rejected", str(error)), 400)
             return
         self._send(answer)
+        if request.get("op") == "shutdown" and answer.get("status") == "shutting_down":
+            self.server.request_shutdown()
 
 
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = False
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_thread = None
+
+    def request_shutdown(self):
+        with self._shutdown_lock:
+            if self._shutdown_thread is None:
+                self._shutdown_thread = threading.Thread(target=self.shutdown,
+                                                         name="friston-arm-shutdown", daemon=True)
+                self._shutdown_thread.start()
 
 
 def serve(config_path=None):

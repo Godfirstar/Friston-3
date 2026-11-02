@@ -26,3 +26,6 @@ data/retired_lore/
 # OS files
 Thumbs.db
 .DS_Store
+
+# Local model, dataset and checkpoint assets are not source history.
+/Friston-3-Models/

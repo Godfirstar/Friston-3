@@ -1,8 +1,14 @@
-"""Friston-3 exhibit entry point and local owner controls."""
+"""程序入口：创建共享设备，再按输入、身份、技能和回复呈现运行接待循环。
+
+控制台语法在 friston3.console；模型规划与技能分发仍交给 Agent。
+"""
 import argparse
-import sqlite3
 
 from friston3.npc.identity import IDENTITY
+from friston3.console import (
+    discard_input, read_instruction, new_visitor, handle_identity_command,
+    run_device_command, handle_session_command, print_help,
+)
 
 
 def _arguments():
@@ -82,74 +88,8 @@ def main():
                     print(f"[{IDENTITY.name}] 资源释放未确认：{type(error).__name__}: {error}")
 
 
-def _discard_input(owner, speech_input):
-    owner.invalidate()
-    if speech_input is not None:
-        speech_input.clear_last_audio()
-
-
-def _read_instruction(owner, speech_input):
-    if speech_input is None:
-        return input("\n你: ").strip(), "text"
-    try:
-        return speech_input.read().strip(), "speech"
-    except KeyboardInterrupt:
-        # The existing scheduler cancels the active microphone job. Interrupted
-        # audio must not identify this local keyboard turn.
-        _discard_input(owner, speech_input)
-        print("\n已进入电脑控制台。输入命令或一句话；直接按 Enter 返回麦克风。")
-        return input("电脑控制台: ").strip(), "text"
-
-
-def _new_visitor(owner, speech_input, npc):
-    _discard_input(owner, speech_input)
-    # Explicit handover also ends any pending owner-only demonstration, so it
-    # cannot accidentally apply to the next visitor's first utterance.
-    profile = owner.handover_visitor()
-    # Switching away from owner retains the owner's private state in NPC; it
-    # only discards the previous anonymous visitor's temporary conversation.
-    npc.set_interlocutor({
-        "role": "visitor", "profile_id": profile, "source": "visitor_handover",
-        "authenticated": False, "local_operator": False,
-        "reason": "现场明确开始接待下一位来访者",
-    })
-    print(f"{IDENTITY.name}: 已开始新访客会话。")
-
-
-def _local_control(command, owner, speech_input, npc):
-    """Called only for keyboard input. Never expose these as planner tools."""
-    words = command.split()
-    if not words or words[0] not in ("/owner", "/visitor"):
-        return False
-    _discard_input(owner, speech_input)
-    if words == ["/owner", "status"]:
-        print(owner.status_text())
-    elif words[:2] == ["/owner", "enroll"] and len(words) in (2, 3):
-        owner.enroll(words[2] if len(words) == 3 else "both")
-    elif words[:2] == ["/owner", "mode"] and len(words) == 3:
-        owner.set_mode(words[2])
-        if words[2] == "owner":
-            print("已启用主人演示模式，120 秒后自动恢复识别；可用 /owner mode auto 提前结束。")
-        elif words[2] == "once":
-            print("30 秒内下一条对话按主人处理，随后恢复自动识别。")
-        elif words[2] == "visitor":
-            _new_visitor(owner, speech_input, npc)
-            print("已固定为访客接待模式；用 /owner mode auto 恢复自动识别。")
-        else:
-            print("已恢复自动识别；电脑键盘输入按主人处理。")
-    elif words == ["/owner", "forget"]:
-        owner.profile.forget()
-        owner.set_mode("auto")
-        print("主人人脸与声纹模板已删除；对话记忆保持原状。")
-    elif words == ["/visitor", "new"]:
-        _new_visitor(owner, speech_input, npc)
-    else:
-        print("身份命令：/owner status | /owner enroll face|voice|both | "
-              "/owner mode auto|owner|visitor|once | /owner forget | /visitor new")
-    return True
-
-
 def _run_session(face, camera, speech_input, owner):
+    """装配技能并管理一轮互动的顺序；退出时关闭语音和机械臂联动。"""
     from friston3.agent import Agent
     from friston3.skills.auto_photo import AutoPhotoSkill
     from friston3.skills.photo import PhotoSkill
@@ -157,6 +97,8 @@ def _run_session(face, camera, speech_input, owner):
     from friston3.skills.npc import NpcTalkSkill
     from friston3.skills.volume import VolumeControlSkill
     from friston3.skills.device_settings import DeviceSettingsSkill
+    from friston3.skills.arms import ArmsControlSkill
+    from friston3.arms.integration import ArmIntegration, is_immediate_stop
     from friston3.vision.yunet_observer import YuNetObserver
     from friston3.planner import LLMPlanner
     from friston3.input_text import prepare_input_text, is_memory_command
@@ -165,46 +107,28 @@ def _run_session(face, camera, speech_input, owner):
     # Warm the resident TTS engine while the dialogue models initialize, and
     # give the volume skill the very same output object used for all replies.
     voice = AgentSpeechOutput(face)
+    arms = ArmIntegration()
     try:
         manager = SkillManager()
         manager.register(PhotoSkill(camera))
         manager.register(AutoPhotoSkill(camera, observer=YuNetObserver()))
-        volume_control = VolumeControlSkill(voice)
-        manager.register(volume_control)
-        device_settings = DeviceSettingsSkill(face)
-        manager.register(device_settings)
+        manager.register(VolumeControlSkill(voice))
+        manager.register(DeviceSettingsSkill(face))
+        manager.register(ArmsControlSkill(arms))
         npc = NpcTalkSkill()
         manager.register(npc)
         agent = Agent(manager, LLMPlanner(manager))
 
-        print("可用指令：")
-        print("  帮我拍张照 / 自动拍照 / 自动拍照，倒计时5秒")
-        print("  声音大一点 / 小一点 / 音量调到百分之五十 / 静音 / 恢复声音 / 现在音量多少")
-        print("  自动选择连接 / 切换到 Wi-Fi / 切换到 USB / 现在怎么连接的")
-        print("  改成自动收音 / 改成触屏收音 / 关闭表演动作 / 现在放在桌上")
-        print("  跟我打个招呼 / 点两下头 / 得意一下 / 看看左边 / 看看主人")
-        print("  主人在你左边 / 主人在你右边：按机器人自身视角设置主人方向")
-        print("  下一位来访者：结束当前访客临时会话，开始下一位")
-        print("  清空记忆：清空当前互动对象的短期记忆")
-        print("  记住：内容 / 忘记：关键词 / 清空长期记忆：在主人电脑控制台管理")
-        print("  查看证据：查看当前会话上一轮的身份与回复依据")
-        print("  /owner status：查看身份状态；/owner enroll face|voice|both：录入主人")
-        print("  /owner mode auto|owner|visitor|once：自动、主人演示、访客、下一句主人")
-        print("  /owner forget：删除身份模板；/visitor new：开始新访客会话")
-        print("  /voice off | on | status | volume 0..100：电脑控制台播音控制（百分比）")
-        print("  /device status | auto | usb | wifi：连接状态和连接偏好")
-        print("  退出：在电脑控制台或由已确认的主人结束程序")
-        if speech_input is not None:
-            print("  等待说话时按 Ctrl+C 进入电脑控制台；控制台空行返回麦克风。")
+        print_help(speech_enabled=speech_input is not None)
 
         while True:
             try:
-                raw_instruction, input_source = _read_instruction(owner, speech_input)
+                raw_instruction, input_source = read_instruction(owner, speech_input)
             except (EOFError, KeyboardInterrupt):
                 print(f"\n{IDENTITY.name} 已退出。")
                 break
             if not raw_instruction:
-                _discard_input(owner, speech_input)
+                discard_input(owner, speech_input)
                 continue
             # /t is an optional local spelling for one typed utterance.
             if input_source == "text" and raw_instruction.lower().startswith("/t "):
@@ -213,66 +137,38 @@ def _run_session(face, camera, speech_input, owner):
                 raw_instruction, input_source=input_source)["normalized_text"]
             command = instruction.rstrip("。！？!?.,，；; ").lower()
             if not instruction:
-                _discard_input(owner, speech_input)
+                discard_input(owner, speech_input)
+                continue
+
+            # Stop has no identity/LLM precondition once input has arrived.
+            # The microphone remains half-duplex: use the independent service
+            # CLI while this thread is occupied by planning or playback.
+            if is_immediate_stop(instruction):
+                discard_input(owner, speech_input)
+                stopped = manager.execute("control_arms", {"operation": "stop"})
+                print(f"[Arms] {stopped['message']}")
                 continue
 
             if input_source == "text":
-                if command.split()[:1] == ["/voice"]:
-                    _discard_input(owner, speech_input)
-                    parts = command.split()
-                    try:
-                        if len(parts) == 2 and parts[1] in ("off", "on"):
-                            volume_control.execute("unmute" if parts[1] == "on" else "mute")
-                            print("[StackChanTTS] " + volume_control.status_text())
-                        elif len(parts) == 2 and parts[1] == "status":
-                            print("[StackChanTTS] " + volume_control.status_text())
-                        elif len(parts) == 3 and parts[1] == "volume":
-                            volume_control.execute("set", int(parts[2]))
-                            print("[StackChanTTS] " + volume_control.status_text())
-                        else:
-                            print("用法：/voice off | /voice on | /voice status | /voice volume 0..100")
-                    except (OSError, ValueError, RuntimeError) as error:
-                        print(f"[StackChanTTS] 设置未完成：{error}")
-                    continue
-                if command.split()[:1] == ["/device"]:
-                    _discard_input(owner, speech_input)
-                    parts = command.split()
-                    try:
-                        if len(parts) == 2 and parts[1] in ("auto", "usb", "wifi"):
-                            result = device_settings.execute("connection", parts[1])
-                            print(f"[StackChan] {result['message']}")
-                        elif parts == ["/device", "status"]:
-                            print("[StackChan] " + device_settings.status_text())
-                            print(face.connection_status())
-                        else:
-                            print("用法：/device status | /device auto | /device usb | /device wifi")
-                    except (OSError, ValueError, RuntimeError) as error:
-                        print(f"[StackChan] 设置未完成：{error}")
+                if command.split()[:1] in (["/arms"], ["/voice"], ["/device"]):
+                    discard_input(owner, speech_input)
+                    run_device_command(command, manager, face)
                     continue
                 # The physical console can inspect the actual previous result
                 # without replacing a visitor's trace with a new owner turn.
                 if command in ("查看证据", "/evidence"):
-                    _discard_input(owner, speech_input)
+                    discard_input(owner, speech_input)
                     print(npc.explain_last_response())
                     continue
-                try:
-                    if _local_control(command, owner, speech_input, npc):
-                        continue
-                except (EOFError, KeyboardInterrupt):
-                    _discard_input(owner, speech_input)
-                    print("电脑控制台操作已取消。")
-                    continue
-                except Exception as error:
-                    _discard_input(owner, speech_input)
-                    print(f"身份命令未完成：{type(error).__name__}: {error}")
+                if handle_identity_command(command, owner, speech_input, npc):
                     continue
             elif command.split()[:1] in (["/owner"], ["/visitor"]):
-                _discard_input(owner, speech_input)
+                discard_input(owner, speech_input)
                 print(f"{IDENTITY.name}: 这项管理操作需要在电脑控制台输入。")
                 continue
 
             if command in ("下一位来访者", "下一位访客", "新访客"):
-                _new_visitor(owner, speech_input, npc)
+                new_visitor(owner, speech_input, npc)
                 continue
 
             pcm = speech_input.last_audio_pcm if input_source == "speech" else None
@@ -289,31 +185,23 @@ def _run_session(face, camera, speech_input, owner):
 
             # Spoken management sees this utterance's context, never the prior
             # speaker's private history or authorization.
-            if command in ("退出", "exit", "quit"):
-                if input_source == "text" or context["role"] == "owner":
-                    break
-                print(f"{IDENTITY.name}: 我会继续接待。结束运行需要由主人操作。")
-                continue
-            if command in ("查看证据", "/evidence"):
-                print(npc.explain_last_response())
-                continue
-            if command in ("清空记忆", "/clear"):
-                npc.clear_history()
-                print(f"{IDENTITY.name}: 当前会话的短期记忆已清空。")
-                continue
-            if command == "清空长期记忆":
-                try:
-                    npc.clear_all_memory()
-                except (OSError, sqlite3.Error, RuntimeError) as error:
-                    print(f"{IDENTITY.name}: 长期记忆未能清空：{error}")
-                else:
-                    print(f"{IDENTITY.name}: 已清空保存的对话、长期记录和设备执行记录。")
+            action = handle_session_command(command, npc, input_source=input_source, context=context)
+            if action == "exit":
+                break
+            if action == "handled":
                 continue
 
             face.on_request()
             try:
                 result = agent.handle(raw_instruction, input_source=input_source, interlocutor=context)
                 executed = result.get("executed_skill")
+                if (executed == "configure_device" and result.get("success") is True
+                        and result.get("setting") == "gestures" and result.get("choice") == "off"):
+                    arm_stop = arms.cancel_dialogue()
+                    if arm_stop is not None:
+                        result["arm_motion_stop"] = arm_stop
+                        if arm_stop.get("success") is not True or arm_stop.get("status") == "stopping":
+                            result["message"] += " 机械臂：" + arm_stop["message"]
                 if executed in ("take_photo", "auto_photo"):
                     npc.record_execution(executed, result)
                 reply_text = str(result.get("message", "任务结束"))
@@ -324,19 +212,23 @@ def _run_session(face, camera, speech_input, owner):
                     reply_text = "可露希尔，" + reply_text
                 print(f"{IDENTITY.name}:", reply_text)
                 face.prepare_reply(result)
-                if (result.get("success", True)
+                arm_start = arms.reply_start(result, allow=not is_memory_command(instruction))
+                if ((result.get("success", True) or executed == "control_arms")
                         and ((executed == "npc_talk" and not is_memory_command(instruction))
-                             or (executed in ("control_volume", "configure_device")
+                             or (executed in ("control_volume", "configure_device", "control_arms")
                                  and result.get("speak_confirmation")))):
-                    voice.speak(reply_text)
+                    voice.speak(reply_text, on_start=arm_start)
+                if arm_start is not None:
+                    arm_start()
                 # Speech consumes the gesture just before the first clip.
                 # A muted/unavailable voice still gets one bounded gesture.
                 face.on_task_completed(result)
             finally:
                 face.on_reply_ready()
     finally:
+        arms.close()
         voice.close()
-        _discard_input(owner, speech_input)
+        discard_input(owner, speech_input)
 
 
 if __name__ == "__main__":

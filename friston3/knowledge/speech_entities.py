@@ -16,7 +16,7 @@ import sqlite3
 from threading import RLock
 import unicodedata
 
-from friston3.knowledge.entity_resolver import _generic_speaker_label
+from friston3.knowledge.entity_resolver import generic_speaker_label
 from friston3.knowledge.lore_text import normalize
 
 
@@ -120,7 +120,7 @@ def _name_rejection(value, *, weak=False):
     if (not value or len(word) > _MAX_NAME_CHARS or not _LABEL.fullmatch(value)
             or word.isdecimal()):
         return 'invalid_shape_or_length'
-    if word in _GENERIC_LABELS or _generic_speaker_label(word):
+    if word in _GENERIC_LABELS or generic_speaker_label(word):
         return 'generic_label'
     if weak and ('的' in word or _GROUP_FORM.search(word)):
         return 'description_or_group'

@@ -8,7 +8,7 @@ from friston3.npc.identity import IDENTITY, interlocutor_route_prompt
 from friston3.npc.persona import PRESENTATION_SCHEMA, PRESENTATION_ROUTE_PROMPT, normalize_presentation
 
 
-ROUTE_TOKENS = 256  # Also leaves room for two small presentation enums.
+ROUTE_TOKENS = 256  # Also leaves room for the small presentation enums.
 _INPUT_TOKENS = NPC_CONTEXT_TOKENS - ROUTE_TOKENS - 320
 ROUTES = ("CHAT", "RETRIEVE", "REUSE", "LIVE", "CLARIFY")
 # Tool task types, not a list of natural-language trigger phrases.
@@ -131,16 +131,18 @@ def build_route_input(user_text, *, history, topic, memory_context, estimate_tok
         tools = "\n".join(f"- {name}: {description}" for name, description in tool_help.items())
         system += (
             "你是实物机器人的统一规划器。按current_request的本轮目标选一个route，仅输出JSON，不输出skill。\n"
-            "【本轮已注册技能】设备操作以注册表为准；另有下述头部表演预设，简介和历史不能扩权。\n" + tools +
+            "【本轮已注册技能】设备操作以注册表为准；另有下述可选表演提示，简介和历史不能扩权。\n" + tools +
             "\n【先选任务】询问本机当前状态也须调用查询技能，不猜数值或否认已注册能力。按整句目标匹配，支持省略、同义及礼貌请求。"
             "排除引用/假设/被否定的操作；禁止修改仍可执行明确查询。仅概念解释、能力介绍或讨论用CHAT；缺必要参数且无默认值才澄清。"
             "工具无法提供的实时信息才用LIVE；人名、旧话题或未确认身份不否定本表的普通技能。"
-            "\n对话arguments={}。头部单次预设已接入：明确要求动作也用CHAT+presentation.gesture，按请求选预设。"
+            "\n对话arguments={}。头部单次预设已接入：明确要求头部动作也用CHAT+presentation.gesture，按请求选预设。"
             "本轮不动用none；自定角度/速度/无限循环不开放。"
-            + ("持续关闭/恢复表演用configure_device的gestures=off/on。"
+            + ("头部和附带机械臂的自动表演开关用configure_device的gestures=off/on。"
                if "configure_device" in tool_help else "") +
+            ("arm_gesture仅用于闲聊。"
+             if "control_arms" in tool_help else "") +
             "动作及UNSUPPORTED固定entity_choices=[]、query=reply=\"\"、followup=detail=false、intent=general。"
-            "多动作/未开放操作/越界选UNSUPPORTED且arguments={}；不改数值、不虚报执行。"
+            "不能用一个注册技能表达的多动作/未开放操作/越界选UNSUPPORTED且arguments={}；不改数值、不虚报执行。"
             "\nknowledge_context仅供原作问答/相关追问，不是设备操作前置条件。\n"
         )
     system += _ROUTE_PROMPT
