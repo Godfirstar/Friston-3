@@ -1,2 +1,2 @@
-"""Local arm execution and dialogue integration (no hardware imports here)."""
+"""本地执行和对话集成（无需硬件导入）。"""
 

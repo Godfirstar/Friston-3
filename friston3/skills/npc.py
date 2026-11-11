@@ -50,10 +50,18 @@ from friston3.npc.prompts import (
 )
 
 
+# 上方 import 把其他模块的名字引入本文件：例如 chat 是 llm.py 的函数，
+# ConversationState/DialogueTurn/PromptBuilder 是各自模块定义的类，不是 Python 内置对象。
 class NpcTalkSkill:
+    # main._run_session 创建并注册；SkillManager.execute 调用下面的 execute。
+    # 一个实例保存“当前说话者”的可变状态，现有主循环按轮串行调用它。
+    # 若以后接多用户并发请求，不能仅把 execute 丢进线程池共用同一实例。
     name = "npc_talk"
+    # name 是类属性，SkillManager.register 读取它作为技能表的键；字符串与类名可以不同。
     @staticmethod
     def normalize_arguments(arguments, *, defaults=False):
+        # SkillManager 的参数检查调用；arguments 是模型/调用方给的参数字典。
+        # staticmethod 不自动传 self；返回只含已检查 user_text 的新字典。
         if set(arguments) != {'user_text'}:
             raise ValueError('对话只接受 user_text')
         text = arguments['user_text']
@@ -62,22 +70,36 @@ class NpcTalkSkill:
         return {'user_text': text}
 
     def __init__(self, model=None, url=OLLAMA_CHAT_URL, *, memory_path=None, db_file=KNOWLEDGE_DB):
+        # main._run_session 用 NpcTalkSkill() 创建技能实例时，Python 自动调用本构造方法。
+        # self 是这个实例本身；self.model 等属性保存下来，之后 execute 等方法还会使用。
+        # model/url 是模型名称/HTTP地址，memory_path/db_file 是记忆库/知识库路径；返回值隐含为 None。
+        # 构造器会打开记忆库、请求 Ollama 预热并准备索引，并非只给字段赋值。
+        # 因此阅读/静态检查可 import 或解析源码，但不要为“看一下对象”随意实例化。
         # Routing and dialogue share the resident model; camera execution
         # remains behind the existing skill interfaces.
+        # or 取第一个真值：没有传模型名时使用 config.py 导入的默认模型名。
+        # self.model 存的是名称字符串，真正模型常驻在 Ollama 进程，不在此属性中。
         self.model = model or OLLAMA_MODEL
         self.url = url
         self.db_file = db_file
+        # ConversationState 是 npc/session.py 的 dataclass；括号创建新对象供当前说话者使用。
         self.session = ConversationState()
+        # [] 是空列表，用于逐次 append 模型调用诊断；不是模型参数或训练数据。
         self._model_calls = []
+        # AgenticSettings 是 npc/agentic_rag.py 的类，defaults() 用该类声明的默认值创建设置实例。
         self.agentic = AgenticSettings.defaults()
+        # {} 是空字典；以 _ 开头只是“内部使用”的命名约定，不会自动产生访问权限限制。
         self._route_trace = {}
         self._retrieval_calls = 0
+        # _turn 仅在执行一轮对话期间持有 DialogueTurn；None 表示现在没有正在执行的回合。
         self._turn = None
         self._speech_entity_error = ''
+        # normalize_interlocutor 是 identity.py 的函数；把缺省身份整理为统一字段的字典。
         self.interlocutor = normalize_interlocutor()
         self._active_profile = self.interlocutor['profile_id']
         self._owner_session = None
         try:
+            # MemoryStore 来自 npc/memory.py；构造持久记忆存储。它与知识资料库不是同一个库。
             self._owner_memory = MemoryStore(memory_path)
         except (OSError, sqlite3.Error) as error:
             self._owner_memory = None
@@ -89,8 +111,12 @@ class NpcTalkSkill:
         self.startup_error = ''
         print(f'[NpcTalkSkill] 模型={self.model}；路由等待上限={self.agentic.route_timeout:g}s；'
               f'回答等待配置={self.agentic.turn_timeout:g}s（故障预算，不是响应速度）')
+        # warm_started 是本方法的局部计时变量；perf_counter 来自 time，单位是秒。
         warm_started = perf_counter()
         try:
+            # self._prompts() 是本类方法，返回 PromptBuilder；随后 .chat(...) 是该对象的方法，
+            # 只组装消息列表。最外层 chat(...) 才是 friston3.llm.chat，实际发送 HTTP 请求。
+            # **OLLAMA_OPTIONS 展开默认选项，后写入的同名键覆盖前值；这里仅请求一个输出 token 预热。
             chat(self._prompts().chat('你好', ''), model=self.model, url=self.url, timeout=60,
                  options={**OLLAMA_OPTIONS, 'num_predict': 1, 'temperature': 0})
             print(f'[NpcTalkSkill] 模型预热完成，耗时 {perf_counter() - warm_started:.2f}s')
@@ -100,6 +126,8 @@ class NpcTalkSkill:
         # Eagerly prepare the small, shared-encoder semantic router BEFORE the
         # interactive prompt, so visitors do not pay its first-use embedding cost.
         # Missing FastEmbed/models are non-fatal: the existing LLM route remains.
+        # SemanticIntentRouter 是 npc/intent_router.py 的类；对象负责“句子像哪种意图”的编码比较。
+        # 它与上面的对话大模型是两种对象：这里用共享 FastEmbed 编码器，不生成回答。
         self.semantic_router = SemanticIntentRouter()
         if not self.semantic_router.error:
             started = perf_counter()
@@ -110,6 +138,8 @@ class NpcTalkSkill:
                 try:
                     from friston3.knowledge.semantic_index import search as warm_lore_index
                     warm_lore_index(IDENTITY.name, top_k=1, db_file=self.db_file)
+                    # connect_lore 是 terra_kb.connect 的导入别名；db 是新打开的只读 SQLite 连接。
+                    # closing 来自 contextlib，退出 with 时调用 db.close()，不会长期占着连接。
                     with closing(connect_lore(self.db_file)) as db:
                         resolve_entity_resolution(db, IDENTITY.name)
                 except (OSError, ValueError, sqlite3.Error, RuntimeError) as error:
@@ -128,12 +158,15 @@ class NpcTalkSkill:
 
     def set_interlocutor(self, context=None):
         """切换整个会话：保存主人状态，新访客使用独立临时记忆。"""
+        # Agent.handle 在准备每轮路由前调用；context 是主程序确认的身份字典或 None。
+        # 本方法更新实例状态、无业务返回值；模型生成的“我是主人”不会直接成为这里的 context。
         checked = normalize_interlocutor(context)
         profile = checked['profile_id']
         if profile != self._active_profile:
             if self._active_profile == 'owner':
                 self._owner_session = self.session
             if profile == 'owner':
+                # 复用保存的主人会话；若没有，构造新会话并显式注入主人 MemoryStore。
                 self.session = self._owner_session or ConversationState(memory=self._owner_memory)
                 self._owner_session = None
             else:
@@ -143,6 +176,8 @@ class NpcTalkSkill:
 
 
     def _prompts(self):
+        # __init__、_agentic_chat、_grounded_answer 等调用这个小入口。
+        # 返回 PromptBuilder 实例，封装“当前会话、身份、知识库版本”这些提示词依赖；此处不调用 LLM。
         return PromptBuilder(self.session, self.interlocutor, self._source_stamp())
 
     def clear_history(self):
@@ -270,10 +305,15 @@ class NpcTalkSkill:
         return tuple((p.stat().st_mtime_ns, p.stat().st_size) if p.is_file() else None for p in paths)
 
     def _remember(self, user_text, reply, packet=None, sent_sources=(), *, persist=True):
+        # _finish_reply 在成功路径提交本轮：history 保存对话，topic 保存可复用证据。
+        # 两者都能帮助下一轮，却只有 sources 能作为原作事实的出处。
+        # user_text/reply 是输入和输出字符串；packet 是证据包，sent_sources 是实际选用的来源序列。
+        # _raw_user_text 是本类辅助方法，从当前 DialogueTurn 取原始文本，便于保留用户真实说法。
         raw_text = self._raw_user_text(user_text)
         record = {"role": "user", "content": raw_text}
         if raw_text != user_text:
             record['normalized_content'] = user_text
+        # history 是 ConversationState 中的 deque；append 每次添加一条消息，满后自动淘汰最旧项。
         self.session.history.append(record)
         self.session.history.append({"role": "assistant", "content": reply})
         packet = packet or {}
@@ -591,6 +631,9 @@ class NpcTalkSkill:
     def _model_result(self, messages, *, schema=None, max_tokens=NPC_REPLY_TOKENS,
                       phase='generation', timeout=None):
         """管理当前回合预算；HTTP 与响应解析交给共同模型入口。"""
+        # _decide_rag、_agentic_chat、_grounded_answer 的生成/核对分支都调用这里。
+        # messages 是 [{role, content}, ...]；schema 是可选结构约定；返回解析后的模型响应字典。
+        # estimate_tokens 是 llm.py 的估算函数；sum 对每条消息的估算数量求和。
         needed = sum(estimate_tokens(m['content']) + 8 for m in messages) + max_tokens + 256
         if needed > NPC_CONTEXT_TOKENS:
             raise ValueError('本轮资料超过可安全核对的上下文预算')
@@ -749,6 +792,10 @@ class NpcTalkSkill:
 
     def _grounded_answer(self, question, packet, memory_context, act):
         """Compose, review, optionally retrieve again, then run local guards."""
+        # _execute 已取得 packet；本方法负责“用证据回答”，不重新决定设备技能。
+        # 检索结果 -> 提示词实际收录 -> 模型选用来源是三个集合，不能混为一谈。
+        # question 是待回答的问题；packet 是来源包；memory_context 是互动记忆文字；act 是对话行为。
+        # 返回 (回复字符串, 问题列表 issues, 实际选用来源ID列表)，由 _execute 决定是否提交为成功回复。
         max_drafts = 2  # Initial answer plus at most one evidence-informed retry.
         reply_limit = 320 if packet.get('response_detail') else 80
         searches, search_open = 0, True
@@ -793,6 +840,8 @@ class NpcTalkSkill:
             messages, sent_sources, contexts = self._prompts().grounded(
                 question, packet, memory_context, act, extra_instruction=instruction, review_budget=True)
             labels = [source['prompt_label'] for source in sent_sources]
+            # E1/E2 等标签只属于本次提示词；持久来源身份仍是 source['id']。
+            # 用 enum 限定可选标签，再把模型选择映射回记录，保留可追踪的出处。
             schema = spoken_response_schema(reply_limit)
             schema['properties'] = {
                 'sources': {'type': 'array', 'maxItems': len(labels),
@@ -1011,20 +1060,33 @@ class NpcTalkSkill:
 
     def prepare_route_context(self, user_text, *, input_source='text'):
         """Gather typed hints once. Neither a vector nor a name selects a route."""
+        # Agent.handle 先调用这里，再交给 Planner；这里只准备候选和会话背景。
+        # 下方查询实体表、编码意图，不等于已检索到支持回答的知识 passages。
+        # user_text 是规范化后的字符串；input_source 标明键盘/语音。返回背景字典供 Planner 读取。
+        # self._recent_topic 是本类方法，返回当前或最近的会话话题，结果存进局部变量 topic。
         topic = self._recent_topic()
+        # resolution 新建“实体解析结果”字典，先给未知状态，成功查询后再替换。
         resolution = {'status': 'unknown', 'entity_ids': [], 'mentions': [],
                       'ambiguities': [], 'used_previous': False}
+        # 一行给四个局部变量分别赋初值：实体列表、错误文字、语音候选列表、语音词表统计。
         entities, resolver_error, speech_candidates, speech_vocabulary = [], '', [], {}
         input_source = 'speech' if input_source == 'speech' else 'text'
         try:
             with closing(connect_lore(self.db_file)) as db:
+                # entity_resolver.py 的函数用当前问题和上轮主体 ID 解析“这个名字/她”指向谁。
+                # topic.get('subjects', []) 缺键时给空列表；[s['id'] for s in ...] 从每个主体取 ID。
                 resolution = resolve_entity_resolution(
                     db, user_text, [s['id'] for s in topic.get('subjects', [])])
+                # [:8] 是列表切片，取前八项；变量 ids 保存它，不会修改原始 resolution 列表。
                 ids = resolution.get('entity_ids', [])[:8]
                 if ids:
+                    # 非空列表在 if 中为真；三个 ID 会产生 '?,?,?'，作为 SQL 的三个占位符。
                     slots = ','.join('?' for _ in ids)
+                    # db.execute 是 SQLite 连接的方法，返回可迭代的行；dict(row) 转成普通字典。
+                    # SQL 只拼接占位符文本，实体 ID 列表另外绑定，避免把内容当 SQL 执行。
                     rows = {row['id']: dict(row) for row in db.execute(
                         f'SELECT id,name,kind,scope FROM entities WHERE id IN ({slots})', ids)}
+                    # rows 是 {实体ID:实体字典}；按 ids 的顺序取回存在的实体，形成给模型看的列表。
                     entities = [rows[entity_id] for entity_id in ids if entity_id in rows]
                 if input_source == 'speech':
                     try:
@@ -1036,18 +1098,23 @@ class NpcTalkSkill:
                         self._speech_entity_error = f'{type(error).__name__}: {error}'
         except (OSError, ValueError, sqlite3.Error, RuntimeError) as error:
             resolver_error = f'{type(error).__name__}: {error}'
+        # SemanticGuess 是 intent_router.py 的 dataclass；默认构造表示 UNCERTAIN，而不是调用模型。
         guess = SemanticGuess()
         if not self.semantic_router.error:
             try:
+                # classify 是构造器中保存的 SemanticIntentRouter 实例方法，返回语义建议对象。
                 guess = self.semantic_router.classify(user_text)
             except Exception as error:
                 self.semantic_router.error = f'{type(error).__name__}: {error}'
         memory_context = ''
         if self.session.memory is not None:
             try:
+                # memory 是 SessionMemory 或主人 MemoryStore；recall 返回与输入有关的互动记忆文字。
                 memory_context = self.session.memory.recall(user_text, include_execution=False)
             except (OSError, sqlite3.Error) as error:
                 print(f'[NpcTalkSkill] 互动记忆读取失败：{error}')
+        # signals 是给规划器看的结构化提示集合；guess.trace() 把语义建议对象转成普通字典。
+        # 这里的 assistant_subject 是配置身份，entity_resolution 是库中实体；两者来源不同。
         signals = {
             'input_source': input_source,
             'interlocutor': {key: self.interlocutor[key] for key in
@@ -1058,6 +1125,7 @@ class NpcTalkSkill:
             'entity_resolution': {
                 'status': resolution.get('status', 'unknown'),
                 'entities': entities,
+                # dict.fromkeys 以 ID 作键去重且保留初次出现顺序；list 再取出这些键。
                 'explicit_entity_ids': list(dict.fromkeys(
                     m['id'] for m in resolution.get('mentions', []) if m.get('id'))),
                 'used_previous': bool(resolution.get('used_previous')),
@@ -1076,10 +1144,13 @@ class NpcTalkSkill:
             signals['entity_resolution']['error'] = resolver_error
         if self.semantic_router.error:
             signals['semantic_evidence_demand']['error'] = self.semantic_router.error
+        # pending 是待澄清问题的副本；deepcopy 递归复制嵌套列表/字典，后续修改不会串到原会话。
         pending = {key: deepcopy(self.session.pending_reference.get(key)) for key in
                    ('question', 'description', 'candidate_ids', 'ambiguities', 'speech_span',
                     'speech_confirmable')
                    if key in self.session.pending_reference}
+        # history_messages 来自 prompts.py，把会话队列整理成模型消息列表；has_evidence 是布尔值。
+        # 返回的不是最终路线，也没有执行任何技能；Agent 会把它传给 LLMPlanner.plan。
         return {'history': history_messages(self.session),
                 'topic': {**{key: deepcopy(topic.get(key)) for key in
                           ('question', 'retrieval_question', 'intent', 'subjects') if key in topic},
@@ -1094,6 +1165,8 @@ class NpcTalkSkill:
 
     def _decide_rag(self, user_text, memory_context):
         """Reuse the unified decision, or route a standalone NPC call once."""
+        # _execute 调用；返回含 route/query/intent 等字段的决策字典。
+        # turn 来自 execute 保存的 DialogueTurn；有 decision 表示 Agent 已经规划过，可直接复用。
         turn = self._turn
         context = turn.route_context if turn.decision is not None else self.prepare_route_context(user_text)
         signals = context.get('signals', {})
@@ -1107,6 +1180,8 @@ class NpcTalkSkill:
         if signals.get('speech_entity_error'):
             self._route_trace['speech_entity_error'] = signals['speech_entity_error']
         if turn.decision is not None:
+            # 正常 Agent 路径已付过一次规划成本，复用决策避免 NPC 再选一次路。
+            # dict 是浅拷贝：这里只读取嵌套值；不能把它当成独立的深层快照。
             decision = dict(turn.decision)
             self._route_trace.update(
                 input=turn.planner_input, decision=decision['route'],
@@ -1251,6 +1326,8 @@ class NpcTalkSkill:
         The model supplies semantics. SQLite validates entity identity, while
         short-term history supplies reference candidates, not factual evidence.
         """
+        # _execute 调用；把用户原话、模型查询和上轮指代绑定成可检索的 task 字典。
+        # decision 是 _decide_rag 的返回值；本方法会查实体，但不在这里生成最终台词。
         topic = self._recent_topic()
         previous = [s['id'] for s in topic.get('subjects', [])]
         query = decision.get('query') or user_text
@@ -1435,6 +1512,11 @@ class NpcTalkSkill:
                 normalize_presentation(composed.get('presentation')))
 
     def _finish_reply(self, user_text, reply, packet, *, sources=(), success=True, pending=None):
+        # 多条回复分支收敛到同一提交点，避免每个分支分别维护历史/话题/澄清。
+        # trace 即使失败仍保留；失败回复不会通过这里进入正常会话历史。
+        # _execute、_agentic_chat、_safe_npc_reply 等调用；sources 是实际选用来源，pending 是待澄清项。
+        # sources=() 用不可变空元组作默认值；返回 SkillManager/Agent 使用的 success/message 字典。
+        # self.session 是 ConversationState，.trace 是其中的 dict；update 是字典的批量写入方法。
         self.session.trace.update(reply=reply, used_source_ids=[source['id'] for source in sources])
         self.session.trace['sent_source_count'] = len(self.session.trace.get('sent_sources', []))
         if success:
@@ -1451,6 +1533,8 @@ class NpcTalkSkill:
 
     def _agentic_chat(self, user_text, decision, memory_context=''):
         """Generate a natural response once, or accept the LLM router's reply."""
+        # 返回字典表示这一轮已处理；返回 None 专门通知 _execute 转入证据恢复。
+        # 这是当前的内部约定，不能把 None 直接理解成“没有生成成功就结束”。
         reply = clean_reply(decision.get('reply', ''))
         presentation = normalize_presentation(decision.get('presentation'))
         model_input = self._route_trace.get('input', [])
@@ -1536,13 +1620,20 @@ class NpcTalkSkill:
 
     def execute(self, user_text, *, context=None):
         """执行一轮对话；context 由 Agent 提供，单独调用时自行准备。"""
+        # 对外入口收拢轮次状态与诊断；_execute 只负责本轮业务分支。
+        # turn 不能放进模型 arguments：它含程序提供的身份和已验证的规划。
+        # SkillManager.execute 调用本方法；user_text 是文本，context 是 Agent 创建的 DialogueTurn。
+        # * 后的 context 必须按名称传入；与之不同，模型只提供经检查的 user_text 技能参数。
         if context is not None:
+            # 点号访问对象属性，['normalized_text'] 再访问该属性字典中的键。
             if context.input_text['normalized_text'] != user_text:
                 raise ValueError('本轮上下文与执行文本不一致')
             if (context.decision is not None
                     and context.route_context['interlocutor_profile'] != self._active_profile):
                 raise ValueError('本轮规划不属于当前说话者会话')
+        # += 1 把当前说话者的轮次计数增加一；会话状态跨轮保存，但下面的诊断列表每轮重置。
         self.session.turn_number += 1
+        # context 有值就复用；否则 prepare_input_text 先产出输入字典，再构造 DialogueTurn。
         self._turn = context or DialogueTurn(prepare_input_text(user_text))
         self._reply_presentation = normalize_presentation()
         self._model_calls = []
@@ -1550,23 +1641,31 @@ class NpcTalkSkill:
         self._route_trace = {'decision': 'PENDING', 'fallback_used': False}
         self.session.trace = {'question': user_text, 'route': 'pending', 'model_called': False}
         try:
+            # _execute 是本类另一个方法：真正处理 CHAT/RETRIEVE 等分支，并返回业务结果字典。
             result = self._execute(user_text)
             presentation = normalize_presentation(
                 self._reply_presentation if result['success'] else None)
             self.session.trace['presentation'] = deepcopy(presentation)
+            # **result 展开原结果的键值，新字典再加 presentation 供主循环呈现语音/表情。
             return {**result, 'presentation': presentation}
         finally:
+            # finally 无论 try 正常结束、提前 return、还是抛异常都会执行，用于统一收尾。
             try:
+                # finish_trace 是 npc/turn.py 导入的函数，更新诊断并返回精简字典，不再调用 LLM。
                 summary = finish_trace(self._turn, self.session.trace, self._route_trace,
                                        self._model_calls, self._retrieval_calls, self.interlocutor)
                 print('[AgenticRAG] ' + json.dumps(summary, ensure_ascii=False))
             finally:
+                # 先生成本轮诊断，再释放临时上下文；异常路径也不会留给下一轮。
                 self._turn = None
 
     def _execute(self, user_text):
+        # 只由上面的 execute 调用；输入是本轮文本，返回 success/message（有时还带附加信息）。
+        # 先处理显式记忆命令和本机真实经历，再决定闲聊/查资料；这些提前 return 都会回到 execute 收尾。
         command_result = self._memory_command(user_text)
         if command_result is not None:
             return command_result
+        # classify_self_question 来自 response_guard.py，返回问题种类，不是本类方法或深度学习训练器。
         kind = classify_self_question(user_text)
         real_history = self._real_history_kind(user_text, kind)
         if real_history:
@@ -1582,6 +1681,7 @@ class NpcTalkSkill:
                 memory_context = self.session.memory.recall(user_text, include_execution=False)
             except (OSError, sqlite3.Error) as error:
                 print(f"[NpcTalkSkill] 互动记忆读取失败：{error}")
+        # packet 将保存证据包；decision 将保存路线；task 将保存解析后的查询。三者承担不同职责。
         packet, decision, task = None, {}, None
         decision = self._decide_rag(user_text, memory_context)
         # The existing narrow self-question classifier identifies only a
@@ -1607,6 +1707,7 @@ class NpcTalkSkill:
             # never merely because an ordinary word resembles a person's name.
             # A unique pending-name confirmation is an existing bounded
             # protocol; it may restore its task even if followup was omitted.
+            # any 对生成器逐项判断，只要有一个语音候选被选中就为真；-1 表示不选择候选。
             uses_speech_entities = any(choice != -1
                                        for choice in decision.get('entity_choices', []))
             continues_pending = bool(self.session.pending_reference and (
@@ -1615,6 +1716,7 @@ class NpcTalkSkill:
                     and bare_text(user_text) in ('对', '是的', '没错'))))
             if (decision['route'] in ('RETRIEVE', 'REUSE')
                     or uses_speech_entities or continues_pending):
+                # task 是 _knowledge_task 返回的普通字典，把问题、主体和指代关系整理在一起。
                 task = self._knowledge_task(user_text, decision)
         except (OSError, ValueError, KeyError, TypeError, sqlite3.Error, RuntimeError) as error:
             self.session.trace.update(route='retrieval_error', error=str(error))
@@ -1636,6 +1738,7 @@ class NpcTalkSkill:
             decision = {**decision, 'route': 'RETRIEVE', 'reply': '', 'query': task['query']}
             self._route_trace.update(decision='RETRIEVE', reason='pending_question_restored')
         if decision['route'] == 'CHAT':
+            # _agentic_chat 是本类闲聊分支；字典表示已处理，None 表示需继续找证据。
             chat_result = self._agentic_chat(user_text, decision, memory_context)
             if chat_result is not None:
                 return chat_result
@@ -1677,7 +1780,10 @@ class NpcTalkSkill:
                 and self.session.topic.get('sources')
                 and self.session.topic.get('source_stamp') == self._source_stamp()
                 and subject_key(task['subjects']) == subject_key(self.session.topic.get('subjects', [])))
+            # REUSE 是模型提议；资料版本、主体和实际旧证据还要匹配才能成立。
+            # 未满足时走同一个 retrieve_packet 接口，不拿旧台词伪装新证据。
             if reuse:
+                # 复用的也是实际资料字典，deepcopy 隔离本轮修改；不是拿上一轮模型台词当出处。
                 packet = {'intent': task['intent'] or self.session.topic.get('intent', 'general'),
                           'subjects': deepcopy(task['subjects']),
                           'entity_ids': [s['id'] for s in task['subjects']],
@@ -1689,6 +1795,8 @@ class NpcTalkSkill:
                 if decision.get('route') == 'REUSE':
                     self._route_trace['reuse_fallback'] = 'evidence_missing_changed_or_different_subject'
                 self._retrieval_calls += 1
+                # retrieve_packet 是 knowledge/terra_kb.py 导入的函数：开只读库、检索并组织证据。
+                # 返回值 packet 供下方 PromptBuilder 使用；检索函数本身不调用对话模型。
                 packet = retrieve_packet(task['query'], resolution=task['resolution'],
                     intent=task['intent'], max_chars=1500, db_file=self.db_file)
             packet['retrieval_question'] = retrieval_question
@@ -1723,8 +1831,10 @@ class NpcTalkSkill:
                                        and packet['conversation_act'] == 'general')
         print(f"[NpcTalkSkill] 图谱命中实体: {packet.get('entity_ids') or '无'}")
         ambiguities = packet.get('resolution', {}).get('ambiguities', [])
+        # 历史中一轮通常有 user/assistant 两项；[-2] 取倒数第二条，再取其 content 文本。
         previous_question = history_messages(self.session)[-2]['content'] if len(self.session.history) >= 2 else ''
         act = discourse_act(user_text, packet['subjects'], previous_question, self.session.pending_reference)
+        # set 把候选 ID 列表转为集合；下方 current_ids & pending_ids 求交集，检查是否答中了待澄清主体。
         pending_ids = set(self.session.pending_reference.get('candidate_ids', []))
         current_ids = set(packet.get('entity_ids', []))
         packet['clarification_resolved'] = bool(self.session.pending_reference and current_ids and not ambiguities and
@@ -1746,6 +1856,8 @@ class NpcTalkSkill:
                             'ambiguities': ambiguities}
             act = 'clarification'
         try:
+            # _prompts() 返回 PromptBuilder；它的 grounded 方法把证据包、问题与记忆组装成提示词。
+            # 三个返回值分别是模型消息列表、实际放进提示词的来源列表、供诊断的上下文信息。
             messages, sent_sources, contexts = self._prompts().grounded(answer_question, packet, memory_context, act)
         except (OSError, ValueError, KeyError, TypeError, sqlite3.Error, RuntimeError) as error:
             self.session.trace.update(route='context_error', generation_error=f'{type(error).__name__}: {error}')
@@ -1794,6 +1906,7 @@ class NpcTalkSkill:
             self.session.trace.update(route='source_excerpt', output_origin='source_excerpt')
         else:
             try:
+                # 真正基于证据生成/核对发生在本类 _grounded_answer；这里解包回复、问题和来源 ID。
                 reply, issues, used_source_ids = self._grounded_answer(
                     answer_question, packet, memory_context, act)
             except (OSError, ValueError, KeyError, TypeError, AttributeError, sqlite3.Error, RuntimeError) as error:
@@ -1827,6 +1940,7 @@ class NpcTalkSkill:
         # Keep only evidence actually selected for the final answer in the
         # topic. A later "why" can use it without trusting old model prose.
         offered_sources = self.session.trace.get('sent_sources', sent_sources)
+        # 模型见过的来源不一定实际用于最终答案；先将最终选用 ID 转成集合，再过滤来源列表。
         selected_ids = set(used_source_ids)
         actual_sources = [source for source in offered_sources if source['id'] in selected_ids]
         return self._finish_reply(user_text, reply, packet, sources=actual_sources,

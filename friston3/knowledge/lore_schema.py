@@ -1,5 +1,15 @@
 """SQLite property graph: statements, source spans and mentions stay distinct."""
+# 这个模块只提供常量，不在 import 时建库；terra_kb.build_db 把 DDL 传给连接的 executescript。
+# DB_VERSION 是当前数据格式标记，terra_kb.connect 读取 meta 表里的 schema 值与它比较。
 DB_VERSION = 'lore_wiki_graph_2'
+# DDL 是下面整个三引号字符串，内部内容是 SQL，不是 Python 语句。
+# 表的关系：entities 存实体；aliases 用 entity_id 指向实体；sources 存原文件/版本/摘要。
+# passages 用 ref_id 指向“这段资料属于谁”，用 source_id 指向出处，并保留原文行号。
+# relations 的 src/dst 分别指向两个实体，passage_id 回指关系原述；方向表示谁的页面作了陈述。
+# event_mentions 只记录活动段落明确提及谁，不能从“共同提及”自动推导两人的关系。
+# PRIMARY KEY 是行的唯一标识；REFERENCES 声明外键；CREATE INDEX 为常用查询建立查找索引。
+# passage_fts 是 FTS5 全文索引：存 tokenize 产生的检索词，rowid 与 passages.id 对应。
+# import_issues 保存导入异常的来源与原因；meta 保存版本/导入统计，不承载对话历史。
 DDL = '''
 PRAGMA foreign_keys=ON;
 CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);

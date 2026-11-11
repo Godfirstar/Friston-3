@@ -29,6 +29,7 @@ def _valid_relation_target(db, relation):
 
 def relation_body(relation):
     """Remove only the importer's synthetic edge label before excerpt ranking."""
+    # relation_text/retrieve_lore 调用；输入关系字典，返回去掉导入器方向前缀后的原述字符串。
     description = relation['description'].strip()
     if '→' in description:
         _, separator, body = description.partition('：')
@@ -39,6 +40,8 @@ def relation_body(relation):
 
 def relation_text(db, relation):
     """Expand only an unambiguous possessive role into a subject predicate."""
+    # retrieve_lore.add_relation 调用；回查来源主体的别名，把有限的称谓格式整理为可读文字。
+    # 返回资料原述的呈现文本，不调用模型，也不从图上的方向推断父子/上下级等关系。
     body = relation_body(relation)
     original = relation['target_label'] + '：' + body
     if relation.get('target_is_group'):
@@ -93,6 +96,8 @@ def _local_facet_score(text, names, facets):
 
 def event_causal_score(text, names, facets, *, owned=False):
     """Prefer a local cause involving the asked actor over an event's epilogue."""
+    # ranked_search 与 retrieve_lore 的“为什么”候选重排调用；返回局部线索分数，非因果模型概率。
+    # names 为当前人物名列表，facets 为问题关键词，owned 表示段落是否属于被问主体。
     heading = re.compile(r'^[*\-\s]*([\w\u3400-\u9fff·・（）() /\-]{1,48})\s*[:：]')
     causal = re.compile(r'因为|由于|导致|致使|使得|为了|源于|缘于|出于|驱使|'
                         r'原因[^。！？]{0,20}(?:是|在于|一样)|'
@@ -118,11 +123,14 @@ def event_causal_score(text, names, facets, *, owned=False):
 
 
 def related_sources(db, ids, intent='relationship', question='', limit=20):
+    # get_card、ranked_search 和 retrieve_lore 调用；返回带来源的已有关系记录列表。
+    # ids 是实体 ID 序列；db 是同一 SQLite 连接；本函数检索/排序，不添加新关系。
     if not ids:
         return []
     # The importer gives some unprofiled organizations several source-local
     # reference nodes. Treat equal labels as search topics, without inventing
     # relations between those nodes.
+    # 复制 ID 序列为新列表，扩充同名 reference 节点不会改动调用方传入的 ids。
     expanded = list(ids)
     for entity_id in ids:
         entity = find_entity(db, entity_id)
@@ -130,9 +138,11 @@ def related_sources(db, ids, intent='relationship', question='', limit=20):
             expanded.extend(row['id'] for row in query_rows(db,
                 "SELECT id FROM entities WHERE kind='reference' AND name=?", (entity['name'],)))
     expanded = list(dict.fromkeys(expanded))
+    # 每个 ID 对应一个 ? 占位符；后面的 (*expanded, *expanded) 把两组 ID 展开成参数元组。
     slots = ','.join('?' for _ in expanded)
     # Two named people ask about their own edge, never arbitrary neighbours.
     operator = 'AND' if intent == 'relationship' and len(ids) >= 2 else 'OR'
+    # query_rows 来自 retrieval_policy；JOIN 两次 entities 取得两端名称，LEFT JOIN 补出处。
     rows = query_rows(db, f'''SELECT r.*,a.name AS src_name,b.name AS dst_name,
         s.source_type,s.path AS source_path,s.url AS source_url,s.revision,
         p.line_start,p.line_end
@@ -149,6 +159,8 @@ def related_sources(db, ids, intent='relationship', question='', limit=20):
     for row in rows:
         row['target_is_group'] = bool(re.search(r'[、,，]', row.get('target_label', '')))
         text = row['description']
+        # Python 布尔值参与数值运算时 True=1、False=0；这里把主体命中与关键词线索加权求和。
+        # 这是启发式排序分，分数高只表示更值得读，不代表关系已经核实。
         score = 45 * (row['src'] in ids) + 55 * (row['src'] in ids and row['dst'] in ids)
         score += 15 * sum(word in text for word in terms)
         score += 12 * sum(word in text for word in topics)
@@ -169,7 +181,10 @@ def ranked_search(db, request, *, limit=3, kinds=None):
     Event mentions retrieve narrative context; they never establish participation
     or a personal relationship. An explicit empty ids list disables name inference.
     """
+    # hybrid_search 与 terra_kb 的 search CLI 调用；request 是 SearchRequest 对象，返回段落列表。
+    # 核心顺序：按主体/关系/事件召回→FTS 补充→共享范围过滤→打分→按正文去重。
     limit = max(1, min(30, int(limit)))
+    # kinds 缺省时用所有段落类型；dict.fromkeys 去重，tuple 固定本次允许类型。
     allow = tuple(dict.fromkeys(PASSAGE_KINDS if kinds is None else kinds))
     if not allow:
         return []
@@ -181,9 +196,11 @@ def ranked_search(db, request, *, limit=3, kinds=None):
     slots = ','.join('?' for _ in allow)
     select = '''SELECT p.*,s.source_type,s.path AS source_path,s.url AS source_url,s.revision
                 FROM passages p LEFT JOIN sources s ON s.id=p.source_id'''
+    # candidates 是 {段落ID:段落字典}；不同查询命中同一段落时只保留一份。
     candidates = {}
 
     def remember(rows):
+        # 闭包：本内部函数直接使用外层 candidates；update 接收 (键,值) 对的生成器。
         candidates.update((row['id'], row) for row in rows)
 
     if intent == 'relationship' and len(ids) >= 2:
@@ -200,6 +217,7 @@ def ranked_search(db, request, *, limit=3, kinds=None):
                     AND p.kind IN ({slots}) ORDER BY p.id LIMIT 80''', (entity_id, *allow)))
     # Separate subject and facet searches: an entire colloquial question is
     # rarely a literal FTS phrase. Pair conjunctions retrieve shared narrative.
+    # phrase_query 来自 lore_text，把主体或关键词转成 FTS 表达式；人物和关注点分开召回。
     name_clauses = [phrase_query(name) for name in names if phrase_query(name)]
     clauses = [phrase_query(term) for term in terms if phrase_query(term)]
     expressions = ([' AND '.join(f'({term})' for term in name_clauses[:3])]
@@ -211,6 +229,7 @@ def ranked_search(db, request, *, limit=3, kinds=None):
         expressions = [f'({name}) AND ({title_expression})' for name in name_clauses] + expressions
     if not names and not expressions:
         expressions = [phrase_query(query)]
+    # 保序去掉空/重复表达式；MATCH ? 使用绑定参数执行全文检索，而非任意 Python 表达式。
     for expression in dict.fromkeys(expression for expression in expressions if expression):
         remember(query_rows(db, f'''SELECT p.*,s.source_type,s.path AS source_path,s.url AS source_url,
                     s.revision,bm25(passage_fts) AS fts_score
@@ -218,13 +237,16 @@ def ranked_search(db, request, *, limit=3, kinds=None):
                 LEFT JOIN sources s ON s.id=p.source_id
                 WHERE passage_fts MATCH ? AND p.kind IN ({slots}) ORDER BY fts_score LIMIT 60''',
                        (expression, *allow)))
+    # SQL 中 bm25 的结果暂存 fts_score；融合主体/类别等信号后才得到本模块统一的 score。
     scored = []
     for item in candidates.values():
+        # SearchRequest 的共享方法让词法召回也遵循与向量召回相同的主体/活动约定。
         item = request.prepare_candidate(item)
         if item is None:
             continue
         content = item['content']
         owner = item['ref_id'] in ids
+        # set 便于集合运算；下面 mentioned & request.event_people 是两个集合的交集。
         mentioned = set(item['matched_subject_ids'])
         if event_scope and not (mentioned & request.event_people):
             continue
@@ -250,8 +272,10 @@ def ranked_search(db, request, *, limit=3, kinds=None):
             score += 80
         if meaningful:
             tokens = set(tokenize(content + ' ' + item['section']).split())
+            # 词集合交集大小 / 查询词集合大小是覆盖比例；这是检索线索，不是模型训练 loss。
             score += 28 * len(meaningful & tokens) / len(meaningful)
             score += 12 * sum(word in content for word in terms)
+        # pop 取出并移除临时 fts_score，缺键取 0；log1p 缩小数值跨度，避免它压过其他分项。
         score += min(5, math.log1p(abs(float(item.pop('fts_score', 0) or 0))))
         if intent == 'personality':
             score += min(22, 3 * sum(word in content for word in PERSONALITY_WORDS))
@@ -262,6 +286,7 @@ def ranked_search(db, request, *, limit=3, kinds=None):
             score += 70 * sum(word in content for word in terms)
         item['score'] = round(score, 3)
         scored.append(item)
+    # sort 原地排序；负分数使高分在前，同分按 ID；下面为多主体问题保留各主体的一条资料。
     scored.sort(key=lambda row: (-row['score'], row['id']))
     if len(ids) >= 2 and intent != 'relationship':
         reserved = []
@@ -271,6 +296,7 @@ def ranked_search(db, request, *, limit=3, kinds=None):
                 reserved.append(own)
         reserved_ids = {row['id'] for row in reserved}
         scored = reserved + [row for row in scored if row['id'] not in reserved_ids]
+    # output 为最终列表，seen 为规范化正文的集合；相同内容即使 ID 不同也不重复占结果位。
     output, seen = [], set()
     for item in scored:
         key = normalize(item['content'])
@@ -284,6 +310,7 @@ def ranked_search(db, request, *, limit=3, kinds=None):
 
 
 def get_card(db, entity_id, max_sections=3):
+    # terra_kb 的 profile/card CLI 调用；返回实体字典加分组段落/关系/活动提及，找不到则返回 None。
     entity = find_entity(db, entity_id)
     if not entity:
         return None
@@ -291,6 +318,7 @@ def get_card(db, entity_id, max_sections=3):
     card['sections'] = {}
     for row in query_rows(db, '''SELECT p.*,s.source_type,s.path AS source_path,s.url AS source_url,s.revision
             FROM passages p LEFT JOIN sources s ON s.id=p.source_id WHERE p.ref_id=? ORDER BY p.id''', (entity_id,)):
+        # sections 是 {类别:段落列表}；setdefault 新类别时创建列表，已有类别时复用同一列表。
         group = card['sections'].setdefault(row['category'], [])
         if len(group) < max(1, int(max_sections)):
             group.append(row)

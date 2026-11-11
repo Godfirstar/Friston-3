@@ -53,14 +53,19 @@ _CACHE_SIZE = 2
 _VOCAB_CACHE = OrderedDict()
 _CACHE = OrderedDict()
 _CACHE_LOCK = RLock()
+# 上面两个 OrderedDict 是进程内缓存；RLock 是 threading 的可重入锁，仅协调缓存读写。
+# 缓存存词表/索引数据，不把调用者的 SQLite 连接长期保存成跨线程共享连接。
 
 
 class SpeechEntityDependencyError(ImportError):
+    # 继承标准 ImportError，调用方可专门识别“缺拼音依赖”，与普通数据库错误分别报告。
     """The pronunciation matcher cannot import its required dependency."""
 
 
 @lru_cache(maxsize=1)
 def _pinyin():
+    # _primary/_readings/_index 调用；返回 pypinyin 模块对象，不加载 ASR 或大语言模型。
+    # lru_cache(maxsize=1) 缓存这个无参数函数结果；实际汉字转读音在后续 lazy_pinyin/pinyin 调用。
     try:
         import pypinyin
     except ImportError as exc:
@@ -73,6 +78,8 @@ def _pinyin():
 
 @dataclass(frozen=True)
 class _Name:
+    # _build_vocabulary.add 创建的数据对象；dataclass 自动生成构造器，frozen 禁止普通属性重赋值。
+    # 保存库内实体、可读名字和别名来源；requires_confirmation 只描述候选解释是否需要确认。
     entity_id: str
     name: str
     alias: str
@@ -84,6 +91,8 @@ class _Name:
 
 @dataclass(frozen=True)
 class _Vocabulary:
+    # names 是 _Name 对象元组，literals 是文字匹配用的嵌套字典，stats 是数量统计。
+    # frozen 约束对象属性赋值，不会递归把这些字典内部内容变成不可变。
     names: tuple
     literals: dict
     literal_names: frozenset
@@ -92,6 +101,8 @@ class _Vocabulary:
 
 @dataclass(frozen=True)
 class _Index:
+    # _build_index 创建：exact 按完整读音查名字，near/deletions 支持有限近音查找。
+    # lengths 保存需要尝试的音节窗口长度，vocabulary 指向产生该索引的词表对象。
     exact: dict
     near: dict
     deletions: dict
@@ -103,9 +114,12 @@ class _Rows:
     """Read sqlite.Row values without modifying the caller's connection."""
 
     def __init__(self, db):
+        # _build_vocabulary 使用 _Rows(db) 包装已有连接；self 是新包装对象，不会另开数据库。
         self.db = db
 
     def execute(self, *args, **kwargs):
+        # *args 收集位置参数、**kwargs 收集命名参数，再原样转交 SQLite 的 execute 方法。
+        # 仅给当前游标设置 Row 格式，避免修改调用方连接的全局 row_factory。
         cursor = self.db.execute(*args, **kwargs)
         cursor.row_factory = sqlite3.Row
         return cursor
@@ -172,19 +186,24 @@ def _reference_people(rows, entities):
 
 
 def _build_vocabulary(db):
+    # _vocabulary 的缓存未命中时调用；只读实体/别名/关系信息，返回 _Vocabulary 对象。
+    # rows 是 _Rows 适配对象，entities 是 {实体ID:实体字典}；这里的 names 还不是热词输出列表。
     rows = _Rows(db)
     entities = {row['id']: dict(row) for row in rows.execute(
         'SELECT id,name,kind,source,source_key FROM entities ORDER BY id')}
     reference_people = _reference_people(rows, entities)
+    # Counter 统计各排除原因；names 按 (实体ID,规范化别名) 去重，literal_names 是明确文字集合。
     excluded, names, literals, literal_names = Counter(), {}, {}, set()
 
     def add(entity, value, origin, priority, *, weak=False):
+        # 内部闭包可更新外层容器；entity 是库内实体，value 是待收录的名字，weak 标记较弱来源。
         alias = _label(value)
         reason = _name_rejection(alias, weak=weak)
         if reason:
             excluded[reason] += 1
             return
         word = normalize(alias)
+        # 调用 _Name 类构造数据实例；这一步没有把 ASR 结果替换成该名字。
         candidate = _Name(entity['id'], entity['name'], alias, priority,
                           entity['kind'], origin,
                           weak or len(word) == 1 or entity['kind'] == 'reference')
@@ -239,6 +258,7 @@ def _build_vocabulary(db):
             add(entity, prefix, 'name_prefix', 35,
                 weak=entity['kind'] == 'dialogue_speaker')
 
+    # _name_order 是本模块排序键函数；先稳定排序，再转元组作为可复用词表。
     ordered = tuple(sorted(names.values(), key=_name_order))
     phonetic = [name for name in ordered if _HAN.fullmatch(normalize(name.alias))]
     stats = {
@@ -256,6 +276,8 @@ def _build_vocabulary(db):
 
 
 def _cache_key(db):
+    # _cached 使用；返回路径/修改时间/大小/WAL状态的元组，无法稳定标记的连接返回 None。
+    # WAL 是 SQLite 的追加写入文件，也计入版本，避免主文件没变但数据已变时误用旧词表。
     # Close the program before replacing the database file, as required by the
     # existing importer. In-memory/edited connections observe their own rows.
     if db.in_transaction or db.total_changes:
@@ -278,10 +300,13 @@ def _cache_key(db):
 
 
 def _cached(db, cache, build):
+    # _vocabulary/_index 的共用缓存函数；build 是传入的函数对象，不是已经计算好的结果。
+    # 命中时返回缓存对象，未命中时 build(db) 现场构建；整个过程不写数据库或磁盘索引。
     key = _cache_key(db)
     if key is not None:
         with _CACHE_LOCK:
             if key in cache:
+                # OrderedDict 的 move_to_end 把刚用过的键放末尾；容量满时淘汰最久未用的前项。
                 cache.move_to_end(key)
                 return cache[key]
     value = build(db)
@@ -305,8 +330,11 @@ def hotwords(db, *, max_chars=10):
     Latin/digit names retain their spelling. Untyped page aliases remain text
     candidates but are excluded from acoustic biasing.
     """
+    # stackchan_integration.voice_input 调用，返回交给 SeACo ASR 的名字字符串列表。
+    # 这些是识别模型的热词条件，不是转写后的强制替换规则；此路径不需要 pypinyin。
     if type(max_chars) is not int or not 1 <= max_chars <= _MAX_NAME_CHARS:
         raise ValueError(f'max_chars 必须是 1..{_MAX_NAME_CHARS} 的整数')
+    # words 维持输出顺序，seen 按规范化文字去重；数据库可能有多个别名记录指向同一写法。
     words, seen = [], set()
     for name in _vocabulary(db).names:
         key = normalize(name.alias)
@@ -319,6 +347,7 @@ def hotwords(db, *, max_chars=10):
 
 def vocabulary_stats(db):
     """Counts for existing evidence records; never print or write name lists."""
+    # NpcTalkSkill.prepare_route_context 调用；返回词表数量/类别等字典，帮助诊断是否加载了预期资料。
     vocabulary = _vocabulary(db)
     return {**vocabulary.stats, 'by_kind': dict(vocabulary.stats['by_kind']),
             'excluded': dict(vocabulary.stats['excluded']),
@@ -326,6 +355,8 @@ def vocabulary_stats(db):
 
 
 def _primary(text):
+    # candidates/_pronunciations 调用；返回每个汉字一个拼音音节的元组，不能对应时返回空元组。
+    # engine 是 _pinyin 返回的模块；lazy_pinyin 是模块函数，不是神经网络的 forward。
     engine = _pinyin()
     values = tuple(engine.lazy_pinyin(
         text, style=engine.Style.NORMAL, errors=lambda value: list(value)))
@@ -336,6 +367,7 @@ def _primary(text):
 
 @lru_cache(maxsize=4096)
 def _readings(char):
+    # _pronunciations 调用；查一个字的多音读法，heteronym=True 保留多读音，缓存减少重复查询。
     engine = _pinyin()
     values = engine.pinyin(char, style=engine.Style.NORMAL, heteronym=True,
                            errors=lambda value: list(value))
@@ -346,6 +378,7 @@ def _readings(char):
 
 
 def _pronunciations(word):
+    # _build_index 调用；从主读音与有限多音组合生成若干音节元组，不推测不存在的中文译名。
     primary = _primary(word)
     if not primary:
         return ()
@@ -354,6 +387,7 @@ def _pronunciations(word):
     positions = [i for i, values in enumerate(alternatives) if values]
     result = [primary]
     for count in (1, 2):
+        # combinations 选择哪些位置换读音；product 列举这些位置的读音组合，二者来自 itertools。
         for changed in combinations(positions, count):
             for values in product(*(alternatives[i] for i in changed)):
                 pronunciation = list(primary)
@@ -386,6 +420,7 @@ def _bucket_add(index, key, value):
 
 
 def _build_index(db):
+    # _index 缓存未命中时调用；输入只读数据库，返回 _Index，不下载文件、不生成词向量。
     vocabulary = _vocabulary(db)
     exact = {}
     for name in vocabulary.names:
@@ -393,18 +428,21 @@ def _build_index(db):
         if not _HAN.fullmatch(word):
             continue
         for pronunciation in _pronunciations(word):
+            # pronunciation 是音节元组，可作为字典键；同读音 group 用实体 ID 保留多个候选。
             group = exact.setdefault(pronunciation, {})
             previous = group.get(name.entity_id)
             if previous is None or _name_order(name) < _name_order(previous):
                 group[name.entity_id] = name
     exact = {key: tuple(sorted(group.values(), key=_name_order))
              for key, group in exact.items()}
+    # near 对部分音节作遮罩分桶，deletions 对缺失一个音节分桶，避免每个片段遍历整个名字库。
     near, deletions = {}, {}
     for pronunciation in exact:
         for masked in _masked(pronunciation):
             _bucket_add(near, masked, pronunciation)
         if len(pronunciation) >= 4:
             for i in range(len(pronunciation)):
+                # 两个切片相加跳过第 i 个音节；原完整读音仍作为桶内值保留，便于追溯候选。
                 _bucket_add(deletions, pronunciation[:i] + pronunciation[i + 1:], pronunciation)
     for table in (near, deletions):
         for key, values in tuple(table.items()):
@@ -423,10 +461,12 @@ def _index(db):
 
 def prepare(db):
     """Prepare the in-memory pronunciation index, without downloading files."""
+    # NPC 构造器调用的预热入口；db 由调用者打开，本函数不返回资料也不改变已保存名字。
     _index(db)
 
 
 def _normalized_offsets(text):
+    # _protected 调用；返回 (规范化文字, 每个规范字符对应的原文下标)，避免规范化后丢失定位。
     chars, positions = [], []
     for i, char in enumerate(text):
         normalized = normalize(char)
@@ -436,6 +476,8 @@ def _normalized_offsets(text):
 
 
 def _protected(index, text, resolution):
+    # candidates 调用；返回原文中已明确识别的名字/标签范围，近音候选不再覆盖这些范围。
+    # vocabulary.literals 是前缀树式嵌套字典，每消费一个字符就取下一层 node。
     normalized, positions = _normalized_offsets(text)
     vocabulary = index.vocabulary
     protected = []
@@ -467,12 +509,15 @@ def _protected(index, text, resolution):
 
 
 def _letter_distance(left, right, limit=2):
+    # _matches 对两个拼音音节比较时调用；返回有限编辑距离，不是向量余弦相似度。
+    # 动态规划只保留 previous（上一行）与 current（当前行），避免保存完整二维表。
     if abs(len(left) - len(right)) > limit:
         return limit + 1
     previous = list(range(len(right) + 1))
     for i, a in enumerate(left, 1):
         current = [i]
         for j, b in enumerate(right, 1):
+            # 三种候选成本对应插入、删除、替换；a!=b 为真时加 1，相同字符无需替换成本。
             current.append(min(current[-1] + 1, previous[j] + 1,
                                previous[j - 1] + (a != b)))
         if min(current) > limit:
@@ -482,6 +527,8 @@ def _letter_distance(left, right, limit=2):
 
 
 def _matches(index, pronunciation, budget):
+    # candidates 调用；输入 _Index、一个音节窗口和共享计数列表，返回 (候选三元组列表, 是否截断)。
+    # 候选三元组为 (_Name, 相似分数, 匹配类型)，分数只是读音匹配线索，不是人物身份概率。
     exact = index.exact.get(pronunciation)
     if exact:
         return [(name, 1.0, 'homophone') for name in exact[:_MAX_BUCKET]], len(exact) > _MAX_BUCKET
@@ -490,6 +537,8 @@ def _matches(index, pronunciation, budget):
     matches, seen, truncated = {}, set(), False
 
     def add(alternative, cost, match_type):
+        # 内部函数把一个替代读音的全部同音名字加入 matches，按实体 ID 仅保留更好的匹配。
+        # nonlocal 允许重新赋值外层布尔变量 truncated；与更新字典内部元素不同。
         nonlocal truncated
         names = index.exact[alternative]
         truncated |= len(names) > _MAX_BUCKET
@@ -514,6 +563,7 @@ def _matches(index, pronunciation, budget):
             seen.add(alternative)
             if not budget[0]:
                 return list(matches.values()), True
+            # budget 是单元素列表，原地减它的第 0 项，外层与其他窗口才能共享剩余比较次数。
             budget[0] -= 1
             allowance = 2 if len(pronunciation) >= 4 else 1
             cost = sum(_letter_distance(a, b, allowance)
@@ -551,24 +601,32 @@ def candidates(db, text, *, resolution=None, limit=3):
     with all remaining sounds exact. Whole-syllable edits require confirmation.
     Omitted alternatives mark the group truncated rather than apparently unique.
     """
+    # NpcTalkSkill.prepare_route_context 调用；text 是 ASR 转写文字，resolution 是已有字面实体解析。
+    # 返回 [{heard,start,end,candidates:[...]}]：原文片段及若干解释；从不原地替换 text，也不改数据库。
+    # 后续由 Planner/NPC 选择或澄清这些候选；“听起来像某名字”不等于本轮一定在问这个人。
     limit = max(0, min(int(limit), _MAX_GROUPS))
     if not isinstance(text, str) or not text or not limit:
         return []
+    # index 是 _Index 对象，_index 会复用或构建读音表；与 semantic_index 的 embedding 索引不同。
     index = _index(db)
     protected = _protected(index, text[:_MAX_TEXT_CHARS + _MAX_LITERAL_CHARS], resolution)
+    # groups 收集原文片段组；budget 用列表包装整数，便于 _matches 在多个调用间共享计数。
     groups, budget = [], [_MAX_NEAR_COMPARISONS]
     for run in _HAN_RUN.finditer(text[:_MAX_TEXT_CHARS]):
+        # 正则 run 是一段中文及分隔空白；positions 保留每个汉字在原文 text 中的真实下标。
         positions = [run.start() + i for i, char in enumerate(run.group())
                      if '\u3400' <= char <= '\u9fff']
         word = ''.join(text[i] for i in positions)
         pronunciation = _primary(word)
         if not pronunciation:
             continue
+        # 按索引中可能的名字长度滑动窗口；width/start 都是音节位置，a/b 才是原文字符范围。
         for width in index.lengths:
             for start in range(len(pronunciation) - width + 1):
                 a, b = positions[start], positions[start + width - 1] + 1
                 if any(x < b and a < y for x, y in protected):
                     continue
+                # 音节切片交给 _matches，返回读音候选与是否遗漏了过多候选；不调用 ASR 重识别。
                 found, truncated = _matches(index, pronunciation[start:start + width], budget)
                 if not found:
                     continue
@@ -579,6 +637,7 @@ def candidates(db, text, *, resolution=None, limit=3):
                      'requires_confirmation': bool(name.requires_confirmation or width == 1
                                                    or match_type == 'syllable_edit')}
                     for name, score, match_type in found[:_MAX_CANDIDATES]]
+                # heard 直接取原文切片；options 另存候选名字，保留“听到什么”和“可能指谁”的区别。
                 group = {'heard': text[a:b], 'start': a, 'end': b, 'candidates': options,
                          'match_type': options[0]['match_type'],
                          'requires_confirmation': all(option['requires_confirmation'] for option in options)}
@@ -590,6 +649,7 @@ def candidates(db, text, *, resolution=None, limit=3):
     groups.sort(key=lambda group: (group['match_type'] == 'syllable_edit',
                                    -len(normalize(group['heard'])),
                                    -group['candidates'][0]['score'], group['start']))
+    # chosen 逐组去掉范围重叠的片段；最终按 start 排序，恢复用户说话中的先后顺序。
     chosen = []
     for group in groups:
         if any(old['start'] < group['end'] and group['start'] < old['end'] for old in chosen):

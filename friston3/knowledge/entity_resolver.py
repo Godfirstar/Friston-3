@@ -7,6 +7,8 @@ from friston3.knowledge.lore_text import normalize
 from friston3.npc.identity import IDENTITY
 
 def _all_aliases(db):
+    # _group_aliases 调用；db 是调用方的只读 SQLite 连接，返回“别名及所属实体”的字典列表。
+    # JOIN 用 aliases.entity_id 对齐 entities.id，让一行同时含别名、优先级与实体类型。
     rows = [dict(row) for row in db.execute('''SELECT a.alias_norm,a.alias,a.entity_id,a.priority,
       a.origin,e.name,e.kind,e.source_key
       FROM aliases a JOIN entities e ON a.entity_id=e.id
@@ -14,6 +16,7 @@ def _all_aliases(db):
     # Canonical entity names must resolve even when an older database omitted
     # the corresponding alias row. Use entity/name pairs: another entity's
     # alias with the same spelling must not hide this canonical candidate.
+    # 集合元素是 (实体ID,规范化别名) 元组；同一个写法可属于不同实体，不能只按文字去重。
     existing = {(row['entity_id'], row['alias_norm']) for row in rows}
     people = db.execute("""SELECT id,name,kind,source_key FROM entities
         WHERE kind IN ('character','machine','fan_machine','dialogue_speaker')
@@ -44,6 +47,7 @@ def _all_aliases(db):
                      'name': entity['name'], 'kind': entity['kind']})
     # A Chinese given-name prefix is useful for names such as 克丽斯腾·莱特.
     # Keep every candidate: shared prefixes must be diagnosed, never guessed.
+    # 先把列表转成固定元组再迭代，因为循环体可能向原 rows 追加前缀别名。
     for row in tuple(rows):
         if row['origin'] != 'canonical_name' or row['kind'] != 'character':
             continue
@@ -56,21 +60,27 @@ def _all_aliases(db):
 
 
 def _group_aliases(db):
+    # 返回 (规范化别名, 此别名的候选列表) 元组；同名的多个人必须都留下给调用方判断。
     groups = {}
     for row in _all_aliases(db):
+        # setdefault 首次建立空列表，后续取回同一列表；append 把该别名的一名候选加进去。
         groups.setdefault(row['alias_norm'], []).append(row)
+    # key=lambda ... 是排序键函数；按别名长度从长到短，优先识别完整名而不是名字里的短片段。
     return tuple(sorted(groups.items(), key=lambda item: len(item[0]), reverse=True))
 
 
 @lru_cache(maxsize=2)
 def _file_alias_groups(path, mtime_ns, size):
     """Reuse the immutable lore snapshot across short-lived read connections."""
+    # lru_cache 来自 functools；路径、修改时间、大小都属于缓存键，替换库后会重新读取别名。
+    # 此处返回的是别名数据，不是供其他线程共用的活跃数据库连接。
     with sqlite3.connect(Path(path).as_uri() + '?mode=ro', uri=True) as snapshot:
         snapshot.row_factory = sqlite3.Row
         return _group_aliases(snapshot)
 
 
 def _alias_groups(db):
+    # resolve_entity_resolution 调用；优先复用已知文件快照，内存库/正在修改的连接则现场读取。
     path = db.execute('PRAGMA database_list').fetchone()[2]
     if path and not db.in_transaction and not db.total_changes:
         try:
@@ -165,6 +175,8 @@ def _has_person_reference(question):
 
 def ordinary_alias_span(text, alias, start, end):
     """Reject a common-noun occurrence without hiding other name occurrences."""
+    # resolve_entity_resolution/retrieve_lore 调用；检查文字命中是否只是普通词的一部分。
+    # text 为规范化问题，alias 为命中别名，start/end 为字符范围；返回布尔判断，不改写问题。
     if alias not in ('真理', '解真'):
         return False
     # Explicit character-reference wording wins over an ambiguous verb such as
@@ -249,20 +261,29 @@ def _explicit_event_reference(question, alias, source_key=''):
 
 def resolve_entity_resolution(db, question, previous_entities=()):
     """Return explicit candidates and ambiguity, plus bounded pronoun resolution."""
+    # NPC.prepare_route_context/_knowledge_task、terra_kb.retrieve_packet 等调用本公共入口。
+    # question 是原问题；previous_entities 是上一话题的实体 ID 序列，只用来辅助解析“她/后来呢”。
+    # 返回含 entity_ids/mentions/ambiguities 的字典；实体身份匹配不代表已经检索到事实证据。
     q = normalize(question)
+    # q 是供比较的规范化字符串，question 仍保留原文；两个字典分别存候选分数与首次出现位置。
     candidates = {}
     mention_positions = {}
+    # mentions 存明确命中，ambiguities 存同名候选；matched_spans 存已占用的文字范围以免重复拆名。
     mentions, ambiguities = [], []
     matched_spans = []
+    # _alias_groups 按长别名优先返回；for 左边解包为别名字符串 word 和该名的候选列表 rows。
     for word, rows in _alias_groups(db):
         if word not in q:
             continue
+        # escape 把姓名中的正则特殊符号当普通文字；finditer 返回匹配对象，start/end 给出位置。
         spans = [(m.start(), m.end()) for m in re.finditer(re.escape(word), q)]
+        # 列表推导式筛掉被更长名字完全覆盖的片段，避免“完整名”同时误认成多个短名。
         spans = [(a,b) for a,b in spans if not any(x <= a and b <= y for x,y in matched_spans)]
         spans = [(a,b) for a,b in spans if not ordinary_alias_span(q, word, a, b)]
         if not spans:
             continue
         priority = max(row['priority'] for row in rows)
+        # 按实体 ID 建字典去重，只保留最高优先级候选；values() 再取回候选字典组成列表。
         best = list({row['entity_id']: row for row in rows if row['priority'] == priority}.values())
         row = best[0]
         if all(item['kind'] in ('character', 'machine', 'fan_machine', 'dialogue_speaker') for item in best):
@@ -294,11 +315,13 @@ def resolve_entity_resolution(db, question, previous_entities=()):
             if not re.search(r'(?<![a-z0-9_])' + re.escape(word) + r'(?![a-z0-9_])', q):
                 continue
         matched_spans.extend(spans)
+        # 多个同级候选时记录歧义，而不是随便取 best[0] 作为最终人物。
         if len(best) != 1:
             ambiguities.append({'alias': row['alias'], 'candidates': [
                 {'id': item['entity_id'], 'name': item['name'], 'alias': item['alias']}
                 for item in best]})
             continue
+        # score 是本地名字匹配排序分数：较长名称与较高来源优先级靠前，不是置信概率。
         score = len(word) * 100 + row['priority']
         mention_positions[row['entity_id']] = min(
             mention_positions.get(row['entity_id'], len(q)), min(start for start, _ in spans))
@@ -309,6 +332,7 @@ def resolve_entity_resolution(db, question, previous_entities=()):
                              'alias': row['alias'], 'origin': row['origin']})
     # Preserve the user's subject order so budgets do not always favor the
     # person with the longest name.
+    # 对字典 sorted 默认遍历其键；这里先按用户提及顺序，再以负分数实现同位置高分优先。
     ids = sorted(candidates, key=lambda key: (mention_positions.get(key, len(q)), -candidates[key]))
     # A fuller name in this same question can settle its accompanying title.
     # Previous discussion alone cannot decide a title shared across timelines.
@@ -341,11 +365,13 @@ def resolve_entity_resolution(db, question, previous_entities=()):
         r'[他她它](?:们)?(?:和|与|跟)|(?:和|与|跟)[他她它](?:们)?', question))
     needs_antecedent = needs_antecedent or (self_relation and person_reference)
     used_previous = False
+    # 只有需要补先行词且当前没有歧义时才使用旧主体，防止新的明确问题被旧话题污染。
     if followup and needs_antecedent and not ambiguities:
         previous = []
         for entity_id in dict.fromkeys(previous_entities):
             if entity_id in ids:
                 continue
+            # ? 绑定当前 ID；(entity_id,) 的逗号让它成为单元素元组，符合 sqlite3 参数接口。
             row = db.execute('SELECT id,name FROM entities WHERE id=?', (entity_id,)).fetchone()
             if row:
                 previous.append(dict(row))
@@ -375,6 +401,7 @@ def resolve_entity_resolution(db, question, previous_entities=()):
             ids.append(item['id'])
             used_previous = True
     ids = ids[:8]
+    # status 区分歧义/已匹配/未知；used_previous 显式说明是否借用了上轮信息，方便诊断。
     return {'status': 'ambiguous' if ambiguities else 'resolved' if ids else 'unknown',
             'entity_ids': ids, 'mentions': mentions, 'ambiguities': ambiguities,
             'used_previous': used_previous,
@@ -383,6 +410,7 @@ def resolve_entity_resolution(db, question, previous_entities=()):
 
 def resolve_entities(db, question, previous_entities=()):
     """Compatibility API; inspect resolve_entity_resolution for ambiguity."""
+    # terra_kb 的图查询、回复实体检查等旧调用点使用；仅返回 ID 列表，完整歧义仍需上面的函数。
     return resolve_entity_resolution(db, question, previous_entities)['entity_ids']
 
 

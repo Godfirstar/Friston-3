@@ -10,19 +10,31 @@ from time import perf_counter
 from friston3.npc.identity import runtime_relationship_evidence
 
 
+# Agent.handle 构造这个对象，再经 SkillManager.execute(context=...) 传给 NPC。
+# 单独调用 NpcTalkSkill.execute 时，也会在缺少 context 的情况下自己构造一份。
 @dataclass
 class DialogueTurn:
+    # @dataclass 按下面字段生成 __init__；类型标注帮助阅读，不自动做运行时校验。
     input_text: dict
+    # input_text 来自 input_text.prepare_input_text，含 raw_text/normalized_text/input_source。
+    # default_factory 在每次构造时调用 dict/list，使不同回合不共享可变容器。
+    # route_context 是 NPC 预先收集的历史、实体候选和语义提示，不是模型任意填写的参数。
     route_context: dict = field(default_factory=dict)
+    # dict | None 表示“字典或尚无决策”；None 是 Python 的空值，不是空字典 {}。
     decision: dict | None = None
+    # planner_input 是发给规划器的消息列表，planner_call 是这次模型请求的诊断信息。
     planner_input: list = field(default_factory=list)
     planner_call: dict = field(default_factory=dict)
-    started_at: float = field(default_factory=perf_counter)
+    started_at: float = field(default_factory=perf_counter)  # 单调计时，只用于时长，不是日期。
 
 
 def planning_failure(turn, interlocutor):
     """规划失败留下诊断，不产生正常对话历史或设备执行记录。"""
+    # 调用方：NpcTalkSkill.record_planning_failure；Agent.handle 在没有可执行计划时转入。
+    # 参数 turn 是上面的 DialogueTurn；interlocutor 是程序确认的当前说话者字典。
+    # 返回 (业务失败结果字典, 诊断字典) 两项，调用方用 result, trace = ... 解包。
     call = turn.planner_call
+    # call 是从对象属性取出的同一个字典；get(key) 缺键时返回 None，不抛 KeyError。
     failed = call.get('status') == 'error'
     timed_out = call.get('error_kind') == 'timeout'
     if timed_out:
@@ -31,9 +43,13 @@ def planning_failure(turn, interlocutor):
         reply = '本轮规划未完成，尚未执行任何设备动作。输入“查看证据”可查看诊断。'
     else:
         reply = '这条指令暂不能执行；没有调用设备。'
+    # “A if 条件 else B”是条件表达式；这里只把真正尝试过的模型调用计入列表。
     calls = [call] if call.get('request_attempted') else []
+    # get 的第二个参数 {} 是缺省值，让缺少 signals 时仍能按字典继续读取。
     signals = turn.route_context.get('signals', {})
+    # perf_counter 来自 time；两个单调时间相减得到秒数，round(..., 3) 保留三位小数。
     elapsed = round(perf_counter() - turn.started_at, 3)
+    # trace 是本函数新建的字典；deepcopy 来自 copy，复制嵌套内容，避免后续改动污染诊断。
     trace = {
         'question': turn.input_text['raw_text'],
         'normalized_question': turn.input_text['normalized_text'],
@@ -62,8 +78,14 @@ def planning_failure(turn, interlocutor):
 
 def finish_trace(turn, trace, route, model_calls, retrieval_calls, interlocutor):
     """所有回复路径共用的诊断收尾，返回适合打印的简短摘要。"""
+    # 调用方：NpcTalkSkill.execute 的 finally；成功、提前 return 和异常都会经过这里。
+    # trace/route 是调用方传入的可变字典，下面 update 会直接更新它们；返回值是摘要副本。
+    # model_calls 是 NPC 阶段的请求列表；retrieval_calls 是检索次数这个整数。
+    # 列表 + 列表产生新列表，把规划器调用和 NPC 调用合并，统一计算一轮总开销。
     calls = ([turn.planner_call] if turn.decision is not None else []) + model_calls
     elapsed = round(perf_counter() - turn.started_at, 3)
+    # dict.update(k=v) 批量写入键；len(calls) 取列表元素数量。
+    # [item['phase'] for item in calls] 是列表推导式：逐个取请求的阶段名。
     route.update(retrieval_calls=retrieval_calls, model_calls=len(calls),
                  npc_model_calls=len(model_calls), model_phases=[item['phase'] for item in calls],
                  elapsed_s=elapsed, fallback_used=bool(route.get('fallback_used') or trace.get('fallback_used')))
@@ -75,10 +97,13 @@ def finish_trace(turn, trace, route, model_calls, retrieval_calls, interlocutor)
                  runtime_relationship_evidence=runtime_relationship_evidence())
     if turn.input_text['input_source'] == 'speech':
         trace['speech_span_basis'] = 'normalized_question'
+    # setdefault 只在键缺失时写默认值，已有的真实审查结果不会被覆盖。
     trace.setdefault('semantic_review_performed', False)
     trace.setdefault('used_source_ids', [])
+    # 花括号里只有值、没有 key:value，所以 hidden 是 set 集合，用于快速判断字段名。
     hidden = {'input', 'chat_input', 'rejected_chat_reply', 'recovery_query',
               'entity_resolution', 'speech_entity_candidates', 'speech_selections'}
+    # .items() 逐个提供 (键, 值)；字典推导式只把适合终端展示的字段复制进 summary。
     summary = {key: value for key, value in route.items() if key not in hidden}
     summary.update(output_route=trace.get('route'), output_origin=trace.get('output_origin'),
                    generation_accepted=trace.get('generation_accepted', False),

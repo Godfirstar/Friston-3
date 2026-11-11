@@ -23,6 +23,8 @@ from friston3.npc.identity import IDENTITY
 
 def concept_term(query):
     """Share the exact asked term between retrieval and answer review."""
+    # concept_definition 以及回复核对路径使用；从“X是什么”提取 X，无法明确提取时返回空字符串。
+    # re.sub 去常见开头，re.fullmatch 要求整句符合模式，group(1) 取正则第一捕获组。
     query = re.sub(r'^(?:请问|请解释(?:一下)?|解释一下)\s*', '', str(query).strip())
     match = re.fullmatch(
         r'(.{1,48}?)(?:的(?:定义|概念)(?:是什么)?|是什么(?:意思)?|什么意思)'
@@ -38,6 +40,8 @@ def concept_definition(query, content):
     This is a conservative textual cue, not independent verification. The
     complete source paragraph must accompany it, including qualifications.
     """
+    # 本模块与 npc.prompts 使用；判断 content 是否含明确的术语定义句，返回 bool。
+    # query 是问题，content 是来源正文；只检查文本形式，不把资料的事实等级提升为已核验。
     term = concept_term(query)
     if not term:
         return False
@@ -58,6 +62,8 @@ def concept_definition(query, content):
 
 
 def _complete_excerpt(text, budget):
+    # build_evidence_packet 的内部 add_evidence 使用；返回预算内的完整句前缀或空串。
+    # budget 是字符数，ends 是句末位置列表；不会随意从半句话中间截断。
     text = re.sub(r'\s+', ' ', str(text or '')).strip()
     if len(text) <= budget:
         return text
@@ -68,12 +74,15 @@ def _complete_excerpt(text, budget):
 
 def _focused_excerpt(text, budget, question, names=(), anchor_names=()):
     """Choose compact complete sentences, including adjacent qualifications."""
+    # add_evidence 调用；从原文选与 question/names 有关的完整句，返回仍保留限定语的节选字符串。
+    # split_sentences/narrative_excerpt 来自 lore_text；它们做文字处理，不调用生成模型。
     text = narrative_excerpt(text)
     sentences = split_sentences(text)
     # Source summaries often enumerate actors as "name: ...". Every later
     # subjectless action in that block still belongs to this local heading,
     # not to another queried person mentioned elsewhere in the passage.
     heading = re.compile(r'^[*\-\s]*[\w\u3400-\u9fff·・（）() /\-]{1,48}\s*[:：]')
+    # headings 是句子下标集合；enumerate 同时提供下标和句子，用于跟踪“人物名：”标题归属。
     headings = {index for index, sentence in enumerate(sentences) if heading.match(sentence)}
     section_start, active_heading = [], None
     for index in range(len(sentences)):
@@ -179,6 +188,8 @@ def _pair_local_candidates(db, hits, entities, *, direct_context=False):
     table are usable lexical anchors. Free-form page aliases can denote a
     group/title and are deliberately insufficient for this narrow shortcut.
     """
+    # build_evidence_packet 在两人物问题中调用；从候选 hits 选局部双人语境，返回段落字典列表。
+    # db 用于回查名字别名，entities 是主体字典列表；结果仍是资料片段，不是新建的人物关系边。
     aliases = {}
     for entity in entities:
         names = [entity['name']]
@@ -254,6 +265,8 @@ def _pair_local_candidates(db, hits, entities, *, direct_context=False):
 
 def _shared_neighbor_evidence(db, ids, question):
     """At most two real edges through a shared node, not an inferred pair edge."""
+    # build_evidence_packet 找不到直接关系时调用；返回已有的两条共同邻接关系作为背景。
+    # A→C 和 B→C 不推出 A→B；下面仅找共同节点并挑一组已有原述。
     if len(ids) != 2 or IDENTITY.entity_id in ids:
         return []
     neighborhoods = [related_sources(db, [entity_id], 'general', question, limit=80) for entity_id in ids]
@@ -265,6 +278,7 @@ def _shared_neighbor_evidence(db, ids, question):
             if neighbor not in ids:
                 neighbors.setdefault(neighbor, []).append(edge)
         mapped.append(neighbors)
+    # 对字典 set(...) 取键集合；& 是交集，得到双方都连接的节点 ID。
     shared = set(mapped[0]) & set(mapped[1])
     choices = [[mapped[0][neighbor][0], mapped[1][neighbor][0]] for neighbor in shared]
     choices.sort(key=lambda edges: (-sum(edge['score'] for edge in edges), edges[0]['id']))
@@ -272,6 +286,7 @@ def _shared_neighbor_evidence(db, ids, question):
 
 
 def _citation(item):
+    # add_evidence 调用；item 是带来源字段的段落/关系字典，返回简短“文件:行号”展示字符串。
     path = item.get('source_path') or item.get('source_id') or '来源未登记'
     # Files and line numbers are enough for the small prompt. Full URLs and the
     # pinned revision are retained in the parallel source record for inspection.
@@ -286,6 +301,8 @@ def _citation(item):
 
 
 def _provenance(item):
+    # add_evidence 调用；返回出处与资料等级字典，未修改原 item。
+    # 下方字典 | 字典合并字段；右侧同名键优先，保证 Wiki 摘要不会继承为“已独立核验”。
     project = item.get('source_type') == 'project_config' or item.get('status') == 'project'
     return {key: item.get(key) for key in ('source', 'source_id', 'source_path', 'source_url',
             'revision', 'line_start', 'line_end')} | {
@@ -411,8 +428,15 @@ def build_evidence_packet(db, question, ids, max_chars=1900, *, intent=None):
     The graph channel is bounded local retrieval, not global GraphRAG or a
     relation inference engine. Every excerpt keeps its original source status.
     """
+    # terra_kb.retrieve_packet 调用这个总入口；db 是已打开连接，question 是查询，ids 是主体 ID。
+    # max_chars 是证据文字预算；返回 {context,intent,subjects,sources,lore_question,retrieval} 字典。
+    # 下游依次使用 SearchRequest、related_sources、hybrid_ranked_search 和本文件的节选辅助函数。
+    # 它只收集/整理证据；最终台词生成在 NpcTalkSkill._grounded_answer，不在这里训练或调用 LLM。
+    # 阶段一：把问题与已解析主体组成共享请求，后面所有召回通道使用同一套查询语义。
     max_chars = max(0, int(max_chars))
+    # SearchRequest 是 retrieval_policy.py 的类；调用类名创建实例，构造器会回查实体与别名。
     request = SearchRequest(db, question, ids, intent)
+    # 多变量赋值按位置接收属性；focused 是确认存在的主体 ID 列表，names 是对应的名字列表。
     entities, focused, names = request.entities, request.ids, request.names
     intent, labels = request.intent, request.labels
     event_scope, event_people = request.event_scope, request.event_people
@@ -425,9 +449,12 @@ def build_evidence_packet(db, question, ids, max_chars=1900, *, intent=None):
         r'哪些(?:人|角色|人物|组织|阵营)|哪几(?:位|个|名)|什么(?:人|角色|组织|阵营)|'
         r'世界观|原作|剧情|人物|角色|组织|阵营|资料|设定|'
         r'.{1,40}(?:和|与).{1,40}(?:之间|冲突|矛盾|差异)', question))
+    # blocks 保存给模型看的证据文字块；sources 保存可追溯的结构化来源记录，二者按成功加入同步更新。
     blocks, sources = [], []
+    # 两个 set 分别按规范化正文、段落 ID 去重，避免同一出处从不同召回通道重复占预算。
     used_text, used_passages = set(), set()
     pair_question = intent == 'relationship' and len(focused) >= 2
+    # retrieval 是诊断字典：记录候选数、覆盖主体、缺口等，帮助解释“这轮为什么找到了这些资料”。
     retrieval = {'strategy': 'hybrid_with_local_graph', 'graph_scope': 'source_edges_and_shared_neighbor',
                  'direct_relation_count': 0, 'candidate_count': 0, 'covered_subject_ids': [],
                  'missing_subject_ids': list(focused), 'expansion_used': False}
@@ -440,15 +467,22 @@ def build_evidence_packet(db, question, ids, max_chars=1900, *, intent=None):
         retrieval['direct_attribute_source_ids'] = []
 
     def remaining():
+        # 闭包读取外层 max_chars/blocks；join 用换行拼已有块，再扣掉下一块所需的分隔换行。
+        # bool(blocks) 在数值运算中是 0 或 1，不是字符串长度。
         return max_chars - len('\n'.join(blocks)) - bool(blocks)
 
     def add_evidence(item, label, raw_text, cap, **evidence):
+        # 本函数下方各分支调用的统一入口；item 为资料记录，label 为显示标题，raw_text 为原述。
+        # cap 是单段字符上限，**evidence 把其余命名参数收为字典（id/kind/subject_id 等）。
+        # 返回 True 表示确实加入了 blocks/sources，False 表示未选用；调用方据此更新覆盖信息。
         metadata = _provenance(item)
+        # metadata 由本文件辅助函数生成；state 是给模型看的资料等级文字，不是机器人观测 state。
         state = ('项目同人配置' if metadata['source_type'] == 'project_config' else
                  '模型生成摘要；存疑' if metadata['status'] == 'uncertain' else '模型生成摘要；未独立核验')
         note = evidence.get('context_note', '')
         prefix = f'[{label}｜{state}] '
         suffix = (f'（证据用途：{note}）' if note else '') + f' [出处：{_citation(item)}]'
+        # 给出处与标签先留空间，再把剩余字数分配给正文；不是简单对全部字符串直接 [:cap]。
         budget = min(cap, remaining() - len(prefix) - len(suffix))
         # Direct assertions already carry a focused, qualified excerpt. Do
         # not optimize it for the proposed (possibly false) value in the query.
@@ -471,6 +505,7 @@ def build_evidence_packet(db, question, ids, max_chars=1900, *, intent=None):
                                        [entity['name'] for entity in entities
                                         if entity['id'] in event_people] if event_scope else
                                        [evidence['subject_name']] if evidence.get('kind') == 'relation' else ())
+        # excerpt 是上面根据资料类别选出的原文片段；空片段或重复正文不加入来源列表。
         if not excerpt or normalize(excerpt) in used_text:
             return False
         if (evidence.get('evidence_role') == 'direct_concept_definition'
@@ -499,8 +534,10 @@ def build_evidence_packet(db, question, ids, max_chars=1900, *, intent=None):
         block = prefix + excerpt + suffix
         if len(block) > remaining():
             return False
+        # append/add 修改闭包捕获的列表/集合内容，所以不需要 nonlocal 重新绑定外层变量。
         blocks.append(block)
         used_text.add(normalize(excerpt))
+        # ** 展开两个字典并添加最终节选；sources 保存实际送出的正文，而非未裁剪的候选全文。
         sources.append({**metadata, **evidence, 'text': excerpt, 'block': block})
         return True
 
@@ -518,6 +555,7 @@ def build_evidence_packet(db, question, ids, max_chars=1900, *, intent=None):
         return {'context': '', 'intent': 'general' if social_only else intent, 'subjects': [], 'sources': [],
                 'lore_question': False, 'retrieval': retrieval}
 
+    # 阶段二：先查明确身份属性与直接关系，避免一条已经足够的原述被大量背景资料挤走。
     if attribute_focus:
         entity = entities[0]
         identity_rows = query_rows(db, '''SELECT p.*,s.source_type,s.path AS source_path,s.url AS source_url,s.revision
@@ -540,6 +578,7 @@ def build_evidence_packet(db, question, ids, max_chars=1900, *, intent=None):
                 break
 
     relational_context = intent == 'experience' and len(focused) >= 2
+    # related_sources 从 lore_search 导入，返回已有关系记录；每条仍附有 source/passages 的来源。
     relations = related_sources(db, focused, 'relationship' if relational_context else intent, question, limit=18)
     if event_scope:
         scoped_relations = []
@@ -556,6 +595,7 @@ def build_evidence_packet(db, question, ids, max_chars=1900, *, intent=None):
     graph_context = []
 
     def add_relation(relation, role='direct_relationship'):
+        # 把关系记录转换为 add_evidence 的统一输入；subject/object 表示原述两端，不猜关系方向。
         label = f"{relation['src_name']}的档案提及{relation['target_label']}｜关系原述"
         group_note = ''
         alias = ''
@@ -571,6 +611,7 @@ def build_evidence_packet(db, question, ids, max_chars=1900, *, intent=None):
             label += '（共同邻接，不代表两人有关系）'
         if relation.get('status') == 'uncertain':
             group_note += '关系原述存疑；保留“似乎”等限定，其他背景不能将其提升为已确认事实。'
+        # relation_text 来自 lore_search，只整理原述格式；下方 add_evidence 才决定是否放入证据包。
         text = relation_text(db, relation)
         if add_evidence(relation, label, text, 350,
                 id=f"relation:{relation['id']}", kind='relation', scope=relation['scope'],
@@ -597,6 +638,8 @@ def build_evidence_packet(db, question, ids, max_chars=1900, *, intent=None):
                               and not any(relation.get('target_is_group') for relation in direct)
                               and _simple_person_pair(question, entities, intent))
     direct_attribute_answer = bool(retrieval.get('direct_attribute_source_ids'))
+    # 阶段三：直接原述未充分覆盖的问题，才调用混合检索，取得词法+语义排序的候选段落 hits。
+    # hits 中的候选尚不等于 sources 中真正交付的证据，后面还会筛选/裁剪/分配预算。
     hits = [] if direct_pair_answer or direct_attribute_answer else hybrid_ranked_search(
         db, request, limit=30 if event_scope or concept_search else 14,
         kinds=tuple(kind for kind in PASSAGE_KINDS if kind != 'relationship'))
@@ -605,6 +648,7 @@ def build_evidence_packet(db, question, ids, max_chars=1900, *, intent=None):
     elif direct_attribute_answer:
         retrieval['strategy'] = 'direct_source_attributes'
     if event_scope:
+        # := 同时保存活动截取结果并判断它是否有效；列表里仅保留仍属于本次活动范围的片段。
         hits = [scoped for item in hits if (scoped := event_scoped_item(item, event_scope))]
         for item in hits:
             item['matched_subject_ids'] = sorted(mentioned_subjects(item, labels)
@@ -645,6 +689,7 @@ def build_evidence_packet(db, question, ids, max_chars=1900, *, intent=None):
                 or (query_tokens and len(query_tokens & set(tokenize(hit['content']).split()))
                     >= min(2, len(query_tokens)))]
 
+    # 根据问题类型在这批候选内重排；这一步不再无条件扩大检索范围或把匹配分数当作真值。
     if concept_search:
         # Reorder only the bounded hybrid candidates. A biography's repeated
         # mentions must not outrank an explicit definition of the asked term.
@@ -697,6 +742,7 @@ def build_evidence_packet(db, question, ids, max_chars=1900, *, intent=None):
 
     # Fair coverage: take one useful passage per explicit subject first, then
     # fill by relevance. A long-name entity must not consume every source slot.
+    # 阶段四：建立实际送入证据包的次序，多主体/多活动先各分到有用资料，再填相关背景。
     ordered = []
     if intent == 'personality' and len(focused) == 1 and not event_scope:
         profile = next((hit for hit in hits if hit['ref_id'] == focused[0]
@@ -728,6 +774,7 @@ def build_evidence_packet(db, question, ids, max_chars=1900, *, intent=None):
                 own = next((hit for hit in hits if entity_id in hit.get('matched_subject_ids', [])), None)
             if own is not None and all(own['id'] != item['id'] for item in ordered):
                 ordered.append(own)
+    # extend 消费生成器，逐条加入尚未选择的 ID；all 要求与已有每条资料都不重复。
     ordered.extend(hit for hit in hits if all(hit['id'] != item['id'] for item in ordered))
     max_sources = (len(hits) if 'pair_local_source_ids' in retrieval else
                    max(2, len(sources) + 1) if retrieval.get('pair_evidence_policy') == 'direct_edges_with_local_support' else
@@ -740,6 +787,7 @@ def build_evidence_packet(db, question, ids, max_chars=1900, *, intent=None):
                    3 if len(focused) == 1 and intent == 'experience'
                    and re.search(r'为什么|为何|原因|起因|怎么会|如何会', question) else
                    4 if direct else max(4, min(8, len(focused) + 3)))
+    # item 为一条候选字典；used_passages 防止前面已加入的直接关系/属性重复进入。
     for item in ordered:
         if item['id'] in used_passages or item['category'] == 'relationship':
             continue
@@ -748,6 +796,7 @@ def build_evidence_packet(db, question, ids, max_chars=1900, *, intent=None):
             continue
         # Allocate enough room for every subject while retaining useful whole
         # sentences. Unused reservations naturally flow to later evidence.
+        # uncovered 是尚未被实际 sources 覆盖的主体；any 扫描已交付来源而不是全部检索命中。
         uncovered = [entity_id for entity_id in focused if not any(
             entity_id in source.get('matched_subject_ids', []) for source in sources)]
         cap = (280 if intent in ('introduction', 'personality') else 340 if direct else 420) if len(uncovered) <= 1 else max(150, min(340, remaining() // len(uncovered) - 160))
@@ -778,6 +827,7 @@ def build_evidence_packet(db, question, ids, max_chars=1900, *, intent=None):
             context_note = pair_local_note
             if direct:
                 context_note += '其他背景不能消解直接关系原述中的推测或时间限定。'
+        # 统一提交点：保存出处、主体、渠道、融合分数和用途，再从原文选取符合预算的片段。
         added = add_evidence(item, owner['name'] + '｜' + item['section'], item['content'], cap,
                 id=f"passage:{item['id']}",
                 kind='overview' if item['category'] == 'identity' and item['ref_id'] in focused else item['kind'],
@@ -825,6 +875,7 @@ def build_evidence_packet(db, question, ids, max_chars=1900, *, intent=None):
                 '未检得双方直接关系条目。正文只能支持其明确陈述；共同提及、共同邻接和图上路径不证明两人关系。')
         if len(note) <= remaining():
             blocks.append(note)
+    # 阶段五：只按最终 sources 计算覆盖与缺口；* 展开每条来源的主体集合，再用 union 求并集。
     covered = set().union(*(set(source.get('matched_subject_ids', [])) for source in sources))
     retrieval['covered_subject_ids'] = [entity_id for entity_id in focused if entity_id in covered]
     retrieval['missing_subject_ids'] = [entity_id for entity_id in focused if entity_id not in covered]
@@ -844,6 +895,8 @@ def build_evidence_packet(db, question, ids, max_chars=1900, *, intent=None):
         retrieval['concept_definition_source_ids'] = [source['passage_id'] for source in definitions]
         if not definitions:
             retrieval['evidence_gaps'].append('no_explicit_definition')
+    # context 是可放进提示词的文字；sources 是同一批资料的结构化记录，供引用/诊断/下轮复用。
+    # 返回后 terra_kb 还会补 resolution 等字段，NPC 再交给 PromptBuilder 和模型生成回复。
     return {'context': '\n'.join(blocks), 'intent': intent,
             'subjects': [{key: e[key] for key in ('id', 'name', 'kind', 'scope')} for e in entities],
             'sources': sources, 'lore_question': bool(lore_request or sources), 'retrieval': retrieval}
