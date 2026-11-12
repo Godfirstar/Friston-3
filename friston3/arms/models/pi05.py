@@ -1,32 +1,37 @@
-"""Friston-3 使用 LeRobot π₀.₅ 的模型适配层。
+"""Friston-3 的 LeRobot π₀.₅ 训练与推理。
 
-训练时，compute_loss 从示教动作构造带噪动作，结合冻结前缀预测速度。
-推理时，Pi05Policy.predict 用同一个动作专家的 sample_actions 生成连续动作块。
-旧版 SemanticPolicy 在示教词表中选择子任务。联合检查点还包含 joint.JointPolicy
-训练的共享语言适配器：高层生成当前子任务文本，低层以该文本为条件生成连续动作。
+JointPolicy 在同一骨干上训练子任务文本、FAST 动作 token 和连续动作速度。
+Pi05Policy 加载检查点，按当前观测生成子任务，再调用动作专家采样动作块。
 """
 from __future__ import annotations
 
-import copy
-import importlib
+import json
 import math
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
 
 import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
-from ..config import JOINT_FORMAT, ACTION, DATASET_JOINTS, JOINTS as ROBOT_JOINT_KEYS, STATE
 from . import loader
-from .weights import checkpoint_reader, fingerprint, read_json
+from .weights import checkpoint_reader, read_json
+from ..config import ACTION, DATASET_JOINTS, JOINT_FORMAT, JOINTS as ROBOT_JOINT_KEYS, POLICY_IMAGE_KEYS, STATE
 
 PALI = 'paligemma_with_expert.paligemma'
 EXPERT = 'paligemma_with_expert.gemma_expert.model'
 PROJECTIONS = ('action_in_proj', 'action_out_proj', 'time_mlp_in', 'time_mlp_out')
 LORA_TARGETS = ('q_proj', 'k_proj', 'v_proj', 'o_proj')
+
+COMPLETE = "Goal complete."
+
+# OpenPI 使用扩展后的 big_vision SentencePiece 行号。HF 可将 loc/seg 记作 added
+# tokens，或另加 <image>；len(HF tokenizer) 和 tokenizer.vocab_size 并不总是此值。
+GEMMA_TEXT_VOCAB = 256_000
+PALI_VOCAB = GEMMA_TEXT_VOCAB + 1024 + 128
+FAST_TOP_ID = PALI_VOCAB - 1 - 128
 
 
 class LoRALinear(nn.Module):
@@ -90,8 +95,8 @@ def attach_trainables(model: nn.Module, rank: int, alpha: float) -> list[str]:
             # isinstance检查类；split按点切开，[-1]取最后段，例如q_proj；只替换目标Linear。
             parent_name, _, leaf = relative.rpartition('.')
             # rpartition从最后一个点切成(父路径,分隔符,叶子名)；_表示本处不使用分隔符。
-            parent = expert.get_submodule(parent_name) if parent_name else expert
-            # 如果没有父路径，就直接以expert作父对象；否则找到对应嵌套子模块。
+            parent = expert.get_submodule(parent_name)
+            # 有父路径找到对应嵌套子模块。
             setattr(parent, leaf, LoRALinear(module, rank, alpha))
             # setattr动态写属性，等价于parent.q_proj=新层；新层内部保留原module作为base。
             targets.append(f'{EXPERT}.{relative}')
@@ -106,7 +111,7 @@ def attach_trainables(model: nn.Module, rank: int, alpha: float) -> list[str]:
         module.train()
         # train()设置层训练模式；与是否求梯度是不同开关，不能用eval替代冻结。
     expert.train()
-    # 后缀训练读取冻结前缀的 KV 缓存。这里关闭专家的梯度检查点，保留缓存路径。
+    # 动作专家读取当前观测的 KV；共享 K/V 适配器通过这条路径收到梯度。
     expert.gradient_checkpointing = False
     return targets
 
@@ -117,45 +122,19 @@ def trainable_dict(model: nn.Module) -> dict[str, nn.Parameter]:
     return {name: p for name, p in model.named_parameters() if p.requires_grad}
 
 
-def adapter_statistics(config: dict, model_dir: Path, rank: int, alpha: float) -> dict:
-    """在加载模型权重之前，请验证适配器的坐标系。"""
-    # 【调用方】trainer.run的resume/init-from路径；核对映射、加载版本和模型配置后返回统计副本。
-    loader.validate_loader_compatibility(config)
-    if config.get('format') not in ('friston_pi05_expert_lora_v1', JOINT_FORMAT):
-        raise ValueError('Expected an action or joint Pi0.5 adapter')
-    # 与部署共用兼容约定；旧检查点按已知历史指纹识别，新检查点按版本识别。
-    model_config = read_json(model_dir / 'config.json')
-    expected = {
-        'joint_order': DATASET_JOINTS,
-        'model_slots': list(range(6)),
-        'supervised_action_dims': 6,
-        'horizon': int(model_config['chunk_size']),
-        'max_action_dim': int(model_config['max_action_dim']),
-        'base_config_sha256': fingerprint(model_dir / 'config.json'),
-        'rank': rank, 'alpha': alpha,
-        'full_training_modules': list(PROJECTIONS),
-    }
-    for key, value in expected.items():
-        if config.get(key) != value:
-            raise ValueError(f'Adapter {key} differs from the current training configuration')
-    if type(config.get('rank')) is not int or config['rank'] < 1:
-        raise ValueError('Adapter LoRA rank must be a positive integer')
-    if (type(config.get('alpha')) not in (int, float)
-            or not math.isfinite(config['alpha']) or config['alpha'] <= 0):
-        raise ValueError('Adapter LoRA alpha must be finite and positive')
-    stats = config.get('statistics')
-    if not isinstance(stats, dict):
-        raise ValueError('Adapter statistics are missing')
+def adapter_statistics(config: dict) -> dict:
+    """读取训练时的归一化统计，确认相机和关节顺序符合当前输入。"""
+    if config["format"] != JOINT_FORMAT:
+        raise ValueError(f"Expected joint checkpoint {JOINT_FORMAT}")
+    if config["image_keys"] != list(POLICY_IMAGE_KEYS) or config["joint_order"] != DATASET_JOINTS:
+        raise ValueError("Checkpoint camera views or joint order differ from the current input")
+    stats = config["statistics"]
     for key in (STATE, ACTION):
-        entry = stats.get(key)
-        if not isinstance(entry, dict) or not {'q01', 'q99'}.issubset(entry):
-            raise ValueError(f'Adapter {key} statistics are missing')
-        low, high = (np.asarray(entry[name], dtype=np.float32) for name in ('q01', 'q99'))
-        if (low.shape != (6,) or high.shape != (6,)
-                or not np.isfinite(low).all() or not np.isfinite(high).all()
-                or np.any(high <= low)):
-            raise ValueError(f'Adapter {key} statistics need six finite, positive quantile spans')
-    return copy.deepcopy(stats)
+        low, high = (np.asarray(stats[key][name], dtype=np.float32) for name in ("q01", "q99"))
+        if (low.shape != (6,) or high.shape != (6,) or not np.isfinite(low).all()
+                or not np.isfinite(high).all() or np.any(high <= low)):
+            raise ValueError(f"{key} requires six finite, positive quantile spans")
+    return stats
 
 
 def load_adapter_weights(parameters: dict[str, nn.Parameter], directory: Path) -> None:
@@ -183,38 +162,28 @@ def tokenizer_for(args):
     return args._tokenizer
 
 
-def _encode_state_task(model, device, state, task, tokenizer, *, padding, state_step=None):
-    """SO-101 六维归一化状态 → 补齐模型槽位 → 拼入任务文本 → token 和有效位。"""
+def _encode_state_task(model, device, state, subtask, tokenizer):
+    """低层提示包含关节控制标记、当前子任务和离散化的 SO-101 状态。"""
     from lerobot.policies.pi05 import processor_pi05 as processor
 
-    # [6] → [1,6] → [1,max_state_dim]。补齐只为适配模型输入，物理关节仍为六个。
-    state = torch.as_tensor(state, dtype=torch.float32).unsqueeze(0)
-    joint_training_format = hasattr(model, "joint_adapter")
-    if joint_training_format:
-        state = state.clamp(-1, 1)
+    state = torch.as_tensor(state, dtype=torch.float32).unsqueeze(0).clamp(-1, 1)
     state = F.pad(state, (0, model.config.max_state_dim - state.shape[-1]))
     transition = {
         processor.TransitionKey.OBSERVATION: {processor.OBS_STATE: state},
-        processor.TransitionKey.COMPLEMENTARY_DATA: {"task": [task]},
+        processor.TransitionKey.COMPLEMENTARY_DATA: {"task": [subtask]},
     }
-    if state_step is None:
-        state_step = processor.Pi05PrepareStateTokenizerProcessorStep(max_state_dim=model.config.max_state_dim)
-    prompt = state_step(transition)[processor.TransitionKey.COMPLEMENTARY_DATA]["task"]
-    if joint_training_format:
-        # 论文的控制模式标签区分关节和末端控制。SO-101 示教记录的是关节目标。
-        # 在 LeRobot 清理下划线之后加标签，训练和部署共用此函数。
-        prompt = [f"<control_mode> joint <control_mode>\n{text}" for text in prompt]
-    limit = model.config.tokenizer_max_length if padding == "max_length" or not joint_training_format else None
-    encoded = tokenizer(prompt, padding=padding, truncation=not joint_training_format,
-                        max_length=limit, return_tensors="pt")
-    if joint_training_format and encoded["input_ids"].shape[-1] > model.config.tokenizer_max_length:
+    state_step = processor.Pi05PrepareStateTokenizerProcessorStep(max_state_dim=model.config.max_state_dim)
+    [prompt] = state_step(transition)[processor.TransitionKey.COMPLEMENTARY_DATA]["task"]
+    # LeRobot 会清理任务中的下划线，控制模式标记需在它格式化提示后添加。
+    encoded = tokenizer(f"<control_mode> joint <control_mode>\n{prompt}", return_tensors="pt")
+    if encoded["input_ids"].shape[-1] > model.config.tokenizer_max_length:
         raise ValueError("Low-level subtask and joint state exceed the prompt length")
     return encoded["input_ids"].to(device), encoded["attention_mask"].to(device=device, dtype=torch.bool)
 
 
 def prepare_inputs(model, args, device, state, images, task):
     """训练样本的当前状态、RGB 图像和指令 → LeRobot 条件前缀输入。"""
-    tokens, text_mask = _encode_state_task(model, device, state, task, tokenizer_for(args), padding="max_length")
+    tokens, text_mask = _encode_state_task(model, device, state, task, tokenizer_for(args))
     processed, masks = prepare_images(model, device, images)
     return {"images": processed, "img_masks": masks, "tokens": tokens, "masks": text_mask}
 
@@ -223,9 +192,8 @@ def prepare_images(model, device, images):
     """各路 RGB 数组 → LeRobot 图像张量及相机有效位，保留模型配置的视角顺序。"""
     from lerobot.policies.pi05.modeling_pi05 import PI05Policy
     # RGB [高,宽,3] → [1,3,高,宽]，并从 uint8 像素改成 [0,1] float。
-    batch = {key: torch.from_numpy(np.ascontiguousarray(rgb)).permute(2, 0, 1).unsqueeze(0).float() / 255.0
-             for key, rgb in images.items()}
-    # 字典推导式保留相机key，对每个rgb做同一变换；items()逐个产生(key,value)。
+    batch = {key: torch.from_numpy(np.ascontiguousarray(images[key])).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+             for key in POLICY_IMAGE_KEYS}
     # ascontiguousarray确保数组在内存连续；from_numpy通常与CPU数组共享数据存储。
     # permute(2,0,1):[高,宽,3]→[3,高,宽]；unsqueeze(0)→[1,3,高,宽]。
     # float()转float32，除255使uint8像素0..255变成0..1；此时尚未做模型的-1..1归一化。
@@ -238,32 +206,8 @@ def prepare_images(model, device, images):
         processed, masks = PI05Policy._preprocess_images(proxy, batch)
         # 调用官方类上的方法并显式传self=proxy；resize+pad到224平方并归一化到[-1,1]。
         # processed 是各视角[1,3,224,224]的list；masks是各视角[1] bool的list。
-    return processed, masks
-
-
-def make_frozen_prefix(model, inputs: dict) -> tuple[torch.Tensor, Any]:
-    """计算图像和任务文本的有效位及各层冻结前缀的 KV 缓存。"""
-    # LeRobot 的 mask 辅助函数随版本位于模型实例或其定义模块。
-    impl = importlib.import_module(type(model).__module__)
-    make_mask = getattr(impl, 'make_att_2d_masks')
-    to4d = getattr(model, '_prepare_attention_masks_4d', None)
-    if to4d is None:
-        to4d = getattr(impl, 'prepare_attention_masks_4d')
-    # no_grad 只关闭计算KV这一段建图；返回普通 tensor，后面的可训练分支仍能正常 backward。
-    with torch.no_grad():
-        # SigLIP 图像嵌入与语言嵌入拼成前缀，一起生成 padding mask 与注意力分组。
-        embeds, pad, att = model.embed_prefix(inputs['images'], inputs['img_masks'], inputs['tokens'], inputs['masks'])
-        mask = to4d(make_mask(pad, att))
-        positions = torch.cumsum(pad, dim=1) - 1
-        pg = model.paligemma_with_expert
-        # 使用 SDPA 为冻结前缀计算注意力。
-        pg.paligemma.model.language_model.config._attn_implementation = 'sdpa'
-        # 只传 prefix embeddings，让 PaliGemma 返回各层 KV。
-        _, cache = pg.forward(attention_mask=mask, position_ids=positions,
-                              past_key_values=None, inputs_embeds=[embeds, None], use_cache=True)
-    if cache is None:
-        raise RuntimeError("Prefix KV cache is missing")
-    return pad.detach(), cache
+    # LeRobot 先放真实图像，随后补其他视角。训练和推理都只编码两路真实观测。
+    return processed[:len(POLICY_IMAGE_KEYS)], masks[:len(POLICY_IMAGE_KEYS)]
 
 
 def flow_inputs(actions: torch.Tensor, noise: torch.Tensor, timestep: torch.Tensor):
@@ -277,7 +221,7 @@ def flow_inputs(actions: torch.Tensor, noise: torch.Tensor, timestep: torch.Tens
 
 def make_flow(model, actions_6, device, seed=None):
     """把一段真实的示教动作，转换成 Flow Matching 训练需要的三个东西：当前位置 x_t、正确速度 u_t、当前时间 t"""
-    # 【调用关系】run / compute_loss → 本函数 → model.sample_noise/sample_time、flow_inputs。
+    # 【调用关系】JointPolicy.flow_loss → 本函数 → model.sample_noise/sample_time、flow_inputs。
     # actions_6:真实示教动作，[H,6]是归一化监督目标；返回 noisy[1,H,D]、target[1,H,D]、timestep[1]。
     # 当前 microbatch 固定为 1，H 与 D 从基础模型配置读取（常见配置 H=50,D=32）。
     if seed is not None:
@@ -300,18 +244,6 @@ def make_flow(model, actions_6, device, seed=None):
     return noisy, target, timestep
 
 
-def velocity(model, pad, cache, noisy, timestep):
-    """给定带噪动作 x_t 和时间 t，由动作专家预测该点的速度。"""
-    # 对照官方 forward 的速度预测：此处沿 denoise_step 的 suffix 分支进入相同动作专家。
-    # embed_suffix、time MLP、AdaRMS 和各层 Attention 均由 LeRobot 完成，不在此处另写一份。
-    # 【调用方】trainer.run/compute_loss；pad是条件有效位mask，cache是冻结prefix的KV。
-    # noisy:[B,H,D]、timestep:[B]输入官方denoise_step；返回速度预测[B,H,D]。
-    # denoise_step 是 LeRobot 的可微动作专家前向。
-    # 不同版本在 denoise_step 是否会克隆其缓存方面有所不同。切勿让训练/评估调用修改已存储的、冻结的前缀缓存。
-    return model.denoise_step(prefix_pad_masks=pad, past_key_values=copy.deepcopy(cache),
-                               x_t=noisy, timestep=timestep)
-
-
 def flow_loss(prediction, target):
     return F.mse_loss(
         prediction[..., :6].float(),
@@ -319,185 +251,294 @@ def flow_loss(prediction, target):
     )
 
 
-def compute_loss(model, inputs, actions_6, device, seed=None):
-    """【调用方】evaluate；将前面的“条件前缀→带噪动作→专家前向→标量loss”函数串成一次计算"""
-    # 第二个返回值是中间张量元组，调用方可在统计后释放；loss本身仍是标量Tensor。
-    pad, cache = make_frozen_prefix(model, inputs)
-    noisy, target, timestep = make_flow(model, actions_6, device, seed)
-    prediction = velocity(model, pad, cache, noisy, timestep)
-    loss = flow_loss(prediction, target)
-    return loss, (pad, cache, noisy, target, timestep, prediction)
+class FastTokenizer:
+    """用官方 FAST+ 发布的两个 JSON 编码动作，无需加载远端 Python 模块。"""
+
+    def __init__(self, directory):
+        from tokenizers import Tokenizer
+
+        directory = Path(directory)
+        settings = directory / "processor_config.json"
+        vocabulary = directory / "tokenizer.json"
+        config = json.loads(settings.read_text(encoding="utf-8"))
+        if config.get("processor_class") != "UniversalActionProcessor":
+            raise ValueError("Expected FAST UniversalActionProcessor in processor_config.json")
+        self.scale = float(config["scale"])
+        self.min_token = int(config["min_token"])
+        self.vocab_size = int(config["vocab_size"])
+        self.bpe = Tokenizer.from_file(str(vocabulary))
+        if (not math.isfinite(self.scale) or self.scale <= 0 or not 0 < self.vocab_size <= FAST_TOP_ID
+                or self.bpe.get_vocab_size() != self.vocab_size):
+            raise ValueError("FAST processor and BPE vocabulary disagree")
+    def encode(self, actions):
+        from scipy.fft import dct
+
+        values = np.asarray(actions, dtype=np.float32)
+        if values.ndim != 2 or values.shape[0] == 0 or values.shape[1] != 6 or not np.isfinite(values).all():
+            raise ValueError("Expected a finite [horizon,6] normalized SO-101 action chunk")
+        # 每个关节沿时间轴变换，按 [频率,关节] 展平，FAST 和联合 Flow 共用分位数裁剪。
+        coeffs = dct(np.clip(values, -1, 1), axis=0, norm="ortho")
+        symbols = np.maximum(np.rint(coeffs * self.scale) - self.min_token, 0).astype(np.int64)
+        text = "".join(map(chr, symbols.ravel().tolist()))
+        ids = self.bpe.encode(text, add_special_tokens=False).ids
+        if not ids or min(ids) < 0 or max(ids) >= self.vocab_size:
+            raise ValueError("FAST encoded an empty sequence or an invalid BPE ID")
+        return ids
 
 
-SEMANTIC_FORMAT = "friston_pi05_semantic_v1"
-COMPLETE = "Goal complete."
+class _KVResidual(nn.Module):
+    """在原线性层返回后叠加 BAx；冻结层可以由 Accelerate 卸载到 CPU。"""
+
+    def __init__(self, projection, rank, alpha, device):
+        super().__init__()
+        self.down = nn.Linear(projection.in_features, rank, bias=False, device=device, dtype=torch.float32)
+        self.up = nn.Linear(rank, projection.out_features, bias=False, device=device, dtype=torch.float32)
+        nn.init.zeros_(self.up.weight)
+        self.scale = alpha / rank
+
+    def add_to_projection(self, projection, args, output):
+        update = self.up(self.down(args[0].to(self.down.weight))).mul(self.scale)
+        return output + update.to(output)
 
 
-class SemanticPolicy:
-    """复用冻结的 π₀.₅ 骨干，只在高层读取语言 hidden 时施加残差。"""
+class SubtaskDecodeError(ValueError):
+    """语言解码未得到以 EOS 结束的有效子任务。"""
 
-    def __init__(self, model, tokenizer, rank, alpha, device):
-        self.model = model
-        self.tokenizer = tokenizer
+
+class JointPolicy:
+    """离散预测共用 PaliGemma 词表和语言层，部署动作继续用 LeRobot sample_actions。"""
+
+    def __init__(self, model, tokenizer, rank, alpha, device, *, fast_dir=None):
+        self.model, self.tokenizer = model, tokenizer
         self.device = torch.device(device)
         pali = model.paligemma_with_expert.paligemma
         self.language = pali.model.language_model
         self.head = pali.lm_head
-        embedding = self.language.get_input_embeddings()
-        if (not isinstance(self.head, nn.Linear) or self.head.weight.shape != embedding.weight.shape
-                or self.head.out_features != tokenizer.vocab_size or self.head.weight.requires_grad):
-            raise ValueError("Semantic prediction requires a frozen PaliGemma vocabulary projection")
-        self.vocab_size, width = self.head.weight.shape
-        # Some HF conversions flag Gemma newline tokens as special. They separate
-        # fields in our prompt and remain valid language input.
-        self.special_ids = {i for i in tokenizer.all_special_ids
-                            if not tokenizer.convert_ids_to_tokens(i).isspace()}
-        special = [tokenizer.pad_token_id, tokenizer.bos_token_id, tokenizer.eos_token_id]
-        if len(set(special)) != 3 or any(i is None or not 0 <= i < self.vocab_size for i in special):
-            raise ValueError("Incompatible text vocabulary or BOS/EOS/padding IDs")
-        if not 0 < rank <= width or not math.isfinite(alpha) or alpha <= 0:
-            raise ValueError("Invalid semantic adapter rank or alpha")
-        self.scale = alpha / rank
-        # adapter 独立注册及存盘；动作前缀从不调用它，也不会把骨干交给语言优化器。
-        self.adapter = nn.Sequential(nn.Linear(width, rank, bias=False), nn.Linear(rank, width, bias=False))
-        self.adapter.to(device=self.device, dtype=torch.float32)
-        nn.init.zeros_(self.adapter[1].weight)
-        self.candidates = {}
+        if (self.head.weight.shape != self.language.get_input_embeddings().weight.shape
+                or self.head.out_features < PALI_VOCAB or self.head.weight.requires_grad):
+            raise ValueError("Joint training needs the frozen, full PaliGemma output and embedding vocabulary")
+        self.eos = tokenizer.eos_token_id
+        specials = (tokenizer.bos_token_id, self.eos, tokenizer.pad_token_id)
+        if len(set(specials)) != 3 or any(i is None or not 0 <= i < GEMMA_TEXT_VOCAB for i in specials):
+            raise ValueError("Incompatible PaliGemma BOS/EOS/pad IDs")
+        self.specials = set(tokenizer.all_special_ids)
+        # Gemma 部分 tokenizer 将普通换行也列入 all_special_ids。提示模板含换行，
+        # 标签仍只接受自然文本；分别处理，避免训练在第一个提示上就失败。
+        line_break = tokenizer.encode("\n", add_special_tokens=False)
+        valid_break = set(line_break).difference(specials, {getattr(tokenizer, "unk_token_id", None)}) if line_break else set()
+        self.prompt_specials = self.specials.difference(valid_break)
+        self.separator_tokens = self._text("|")
+        self.fast = FastTokenizer(fast_dir) if fast_dir is not None else None
+        attention = self.language.layers[-1].self_attn
+        if not 0 < rank <= attention.k_proj.in_features or not math.isfinite(alpha) or alpha <= 0:
+            raise ValueError("Invalid shared VLM adapter rank or alpha")
+        if hasattr(model, "joint_adapter"):
+            raise ValueError("The shared VLM adapter was already attached")
+        # 模块单独注册在模型根节点，优化器、保存和恢复使用同一组参数名。保持原投影
+        # 及其权重装载 hook 完整；在 CPU 卸载层上，原权重静止时可能处于 meta 设备。
+        model.joint_adapter = nn.ModuleDict()
+        for name in ("k_proj", "v_proj"):
+            projection = getattr(attention, name)
+            residual = _KVResidual(projection, rank, alpha, self.device)
+            model.joint_adapter[name] = residual
+            projection.register_forward_hook(residual.add_to_projection)
 
-    def _text_ids(self, text):
+    def _text(self, text, *, prompt=False):
         ids = self.tokenizer.encode(text, add_special_tokens=False)
-        if (not ids or len(ids) > self.model.config.tokenizer_max_length
-                or any(i in self.special_ids or i < 0 or i >= self.vocab_size for i in ids)):
-            raise ValueError("Semantic text is empty, too long, or contains special/out-of-vocabulary tokens")
+        forbidden = self.prompt_specials if prompt else self.specials
+        if not ids or any(i in forbidden or not 0 <= i < GEMMA_TEXT_VOCAB for i in ids):
+            raise ValueError("Expected ordinary PaliGemma text tokens")
         return ids
 
-    def _target(self, subtask):
-        if subtask is not None and (not isinstance(subtask, str) or not subtask.strip()
-                                   or subtask != subtask.strip() or subtask.casefold() == COMPLETE.casefold()):
-            raise ValueError(f"Invalid subtask label or collision with reserved text {COMPLETE!r}")
-        return self._text_ids(COMPLETE if subtask is None else subtask) + [self.tokenizer.eos_token_id]
+    def _goal_inputs(self, images, masks, goal, state, views=()):
+        state = np.asarray(state, dtype=np.float32)
+        if state.shape != (6,) or not np.isfinite(state).all():
+            raise ValueError("High-level prediction requires six finite normalized joint readings")
+        if not isinstance(goal, str) or not goal.strip():
+            raise ValueError("A nonempty global goal is required")
+        bins = np.clip(np.floor((state + 1) * 128), 0, 255).astype(np.int64)
+        joints = " ".join(map(str, bins))
+        request = "Current subtask:"
+        if views:
+            request = "Views: " + ", ".join(views) + "\nRelevant boxes by view, then current subtask:"
+        prompt = f"Goal: {goal.strip()}\nState: {joints}\n{request}\n"
+        tokens = [self.tokenizer.bos_token_id, *self._text(prompt, prompt=True)]
+        if len(tokens) > self.model.config.tokenizer_max_length:
+            raise ValueError("Global goal plus current state exceeds the model's prompt length")
+        ids = torch.tensor([tokens], device=self.device)
+        return {"images": images, "img_masks": masks, "tokens": ids, "masks": torch.ones_like(ids, dtype=torch.bool)}
 
     def _mask(self, allowed):
-        # PiGemma 的 SDPA 要求加性 mask 与 query 同 dtype；0 可见，极小值屏蔽。
         dtype = self.language.layers[0].self_attn.q_proj.weight.dtype
-        mask = torch.zeros_like(allowed, dtype=dtype).masked_fill_(~allowed, torch.finfo(dtype).min)
-        return mask[:, None]
+        return torch.zeros_like(allowed, dtype=dtype).masked_fill_(~allowed, torch.finfo(dtype).min)[:, None]
 
-    @torch.no_grad()
-    def _observe(self, images, img_masks, global_goal, answer_prefix, use_cache):
-        if not isinstance(global_goal, str) or not global_goal.strip():
-            raise ValueError("Semantic prediction requires a global goal")
-        if len(images) != len(img_masks) or not images or any(mask.shape != (1,) for mask in img_masks):
-            raise ValueError("Semantic prediction requires one current frame per configured camera")
-        views = [(image, mask) for image, mask in zip(images, img_masks, strict=True) if mask.item()]
-        if not views:
-            raise ValueError("Semantic prediction received no observed camera view")
-        prompt = self._text_ids(f"Goal: {global_goal.strip()}\nCurrent subtask:\n")
-        ids = [self.tokenizer.bos_token_id] + prompt + list(answer_prefix)
-        tokens = torch.tensor([ids], device=self.device)
-        embeds, valid, _ = self.model.embed_prefix(
-            [image for image, _ in views], [mask for _, mask in views],
-            tokens, torch.ones_like(tokens, dtype=torch.bool))
-        # 图像和提示互见；任何前缀位置都看不到答案，每个答案位置只能看到左侧及自身。
-        groups = torch.zeros_like(valid, dtype=torch.long)
+    def _observe(self, inputs, answer_prefix, *, use_cache):
+        # 一个训练样本使用两路真实图像，最后一个提示 token 负责预测第一个目标。
+        tokens = inputs["tokens"][:, inputs["masks"][0]]
+        if tokens.shape[1] == 0:
+            raise ValueError("Empty language prompt")
         if answer_prefix:
-            groups[:, -len(answer_prefix):] = 1
-        groups = groups.cumsum(dim=1)
-        allowed = (groups[:, None, :] <= groups[:, :, None]) & valid[:, None, :] & valid[:, :, None]
+            tokens = torch.cat((tokens, tokens.new_tensor([answer_prefix])), dim=1)
+        with torch.no_grad():
+            embeds, valid, _ = self.model.embed_prefix(
+                inputs["images"], inputs["img_masks"],
+                tokens, torch.ones_like(tokens, dtype=torch.bool))
+        if embeds.shape[1] > self.language.config.max_position_embeddings:
+            raise ValueError("Image, prompt and target tokens exceed the language context")
+        group = torch.zeros_like(valid, dtype=torch.long)
+        if answer_prefix:
+            group[:, -len(answer_prefix):] = 1
+        group = group.cumsum(1)
+        # 前缀双向且看不到标签；每个 teacher-forced 答案 token 只看自身和左侧。
+        allowed = (group[:, None, :] <= group[:, :, None]) & valid[:, :, None] & valid[:, None, :]
+        self.language.config._attn_implementation = "sdpa"
         result = self.language(inputs_embeds=embeds, attention_mask=self._mask(allowed),
                                position_ids=valid.long().cumsum(1) - 1, use_cache=use_cache)
         return result.last_hidden_state, result.past_key_values, valid
 
-    def _logits(self, hidden):
-        value = hidden.float()
-        adapted = value + self.scale * self.adapter(value)
-        return self.head(adapted.to(self.head.weight.dtype)).float()
+    def _block_ce(self, hidden, ids):
+        logits = self.head(hidden.to(self.head.weight.dtype))[..., :PALI_VOCAB]
+        return F.cross_entropy(logits.float(), ids, reduction="sum")
 
-    def loss(self, images, img_masks, global_goal, subtask):
-        """单帧 teacher forcing；只在下一个标签 token 和末尾 EOS 上计算 CE。"""
-        target = self._target(subtask)
-        hidden, _, _ = self._observe(images, img_masks, global_goal, target[:-1], use_cache=False)
-        # 第一项是提示末位置对首 token 的预测；B=1 不填充文本，也不监督视觉或提示。
-        logits = self._logits(hidden[0, -len(target):])
-        return F.cross_entropy(logits, torch.tensor(target, device=self.device))
+    def _loss(self, inputs, target):
+        hidden, _, _ = self._observe(inputs, target[:-1], use_cache=False)
+        selected = hidden[0, -len(target):]
+        target_ids = torch.tensor(target, device=selected.device)
+        # 共享词表有 25 万行；分块重算输出层，避免保存整个动作序列的 float32 logits。
+        total = selected.new_zeros((), dtype=torch.float32)
+        for features, ids in zip(selected.split(16), target_ids.split(16), strict=True):
+            if features.requires_grad and torch.is_grad_enabled():
+                total = total + checkpoint(self._block_ce, features, ids, use_reentrant=False)
+            else:
+                total = total + self._block_ce(features, ids)
+        return total / len(target)
 
-    def set_candidates(self, subtasks):
-        if not isinstance(subtasks, list) or not subtasks or not all(isinstance(s, str) for s in subtasks):
-            raise ValueError("Semantic checkpoint requires a nonempty subtask vocabulary")
-        candidates = {tuple(self._target(text)): text for text in [*subtasks, None]}
-        if len(candidates) != len(subtasks) + 1:
-            raise ValueError("Semantic labels collide after tokenization")
-        self.candidates = candidates
+    def flow_loss(self, inputs, actions_6, seed=None):
+        """联合阶段 α·Flow 的未加权 MSE。干净前缀的 K/V 对共享适配器保持可微。"""
+        # 沿用相同的图像、指令、状态前缀。这里不拼入任何真实 FAST token，
+        # 不复用上一次更新的缓存。冻结视觉与词嵌入；最后一层 K/V 的残差参与求导。
+        _, cache, valid = self._observe(inputs, [], use_cache=True)
+        if cache is None:
+            raise RuntimeError("Action expert requires the observation prefix KV")
+        # 两种动作目标使用同一段在训练集分位数范围内归一化的示教。
+        noisy, target, timestep = make_flow(self.model, np.clip(actions_6, -1, 1), self.device, seed)
+        # 原生 denoise_step 为本次后缀处理 clone K/V，tensor.clone 保留梯度。
+        prediction = self.model.denoise_step(prefix_pad_masks=valid, past_key_values=cache,
+                                             x_t=noisy, timestep=timestep)
+        return flow_loss(prediction, target)
+
+    def fast_loss(self, inputs, actions_6):
+        """低层输入已含标注子任务、状态及 Action 提示。目标为动作 token、终止符、EOS。"""
+        if self.fast is None:
+            raise ValueError("Set --fast-tokenizer-dir to a local FAST+ snapshot for FAST supervision")
+        if np.shape(actions_6) != (self.model.config.chunk_size, 6):
+            raise ValueError("FAST and Flow require the same SO-101 action horizon")
+        target = [FAST_TOP_ID - i for i in self.fast.encode(actions_6)]
+        return self._loss(inputs, target + self.separator_tokens + [self.eos])
+
+    def _box_separator(self):
+        if len(self.separator_tokens) != 1:
+            raise ValueError("Grounded output needs a single-token '|' view separator")
+        return self.separator_tokens[0]
+
+    def _box_target(self, boxes):
+        # 每个实际视角一组，| 结束该视角；连续两个 | 表示其间视角被标注为无相关目标。
+        groups = {view: [] for view in POLICY_IMAGE_KEYS}
+        for box in boxes:
+            xmin, ymin, xmax, ymax = box["xyxy"]
+            if box["view"] not in groups or not (0 <= xmin < xmax <= 1 and 0 <= ymin < ymax <= 1):
+                raise ValueError("Invalid normalized box or unobserved grounding camera")
+            groups[box["view"]].append((math.floor(ymin * 1023), math.floor(xmin * 1023),
+                                        math.ceil(ymax * 1023), math.ceil(xmax * 1023)))
+        target = []
+        separator = self._box_separator()
+        for view in POLICY_IMAGE_KEYS:
+            for coords in sorted(groups[view]):
+                target.extend(GEMMA_TEXT_VOCAB + c for c in coords)
+            target.append(separator)
+        return target
+
+    def semantic_loss(self, images, img_masks, global_goal, subtask, state, boxes=None):
+        views = POLICY_IMAGE_KEYS if boxes is not None else ()
+        inputs = self._goal_inputs(images, img_masks, global_goal, state, views)
+        if subtask is not None and (not isinstance(subtask, str) or not subtask.strip()
+                                    or subtask.strip().casefold() == COMPLETE.casefold()):
+            raise ValueError("Use null for completion and nonempty text for the current subtask")
+        target = self._box_target(boxes) if boxes is not None else []
+        target.extend(self._text(COMPLETE if subtask is None else subtask.strip()) + [self.eos])
+        if len(target) > self.model.config.tokenizer_max_length:
+            raise ValueError("Subtask target is longer than the inference generation budget")
+        return self._loss(inputs, target)
 
     @torch.no_grad()
-    def predict(self, images, img_masks, global_goal):
-        if not self.candidates:
-            raise RuntimeError("Missing semantic checkpoint vocabulary")
-        hidden, cache, valid = self._observe(images, img_masks, global_goal, [], use_cache=True)
+    def predict_result(self, images, img_masks, global_goal, state, *, predict_boxes=False):
+        """按观察视角生成可选目标框，随后生成当前子任务。显式完成文本才表示任务结束。"""
+        views = POLICY_IMAGE_KEYS if predict_boxes else ()
+        inputs = self._goal_inputs(images, img_masks, global_goal, state, views)
+        hidden, cache, valid = self._observe(inputs, [], use_cache=True)
         if cache is None:
-            raise RuntimeError("Semantic language decoder did not return a KV cache")
-        remaining = list(self.candidates)
-        offset = 0
-        while len(remaining) > 1:
-            # 受约束的贪心解码；共享开头的标签继续逐词比较，EOS 也可与较长标签竞争。
-            options = sorted({ids[offset] for ids in remaining})
-            if len(options) > 1:
-                scores = self._logits(hidden[:, -1])[:, options]
-                if not torch.isfinite(scores).all():
-                    raise ValueError("Nonfinite semantic token scores")
-                token = options[scores.argmax().item()]
-                remaining = [ids for ids in remaining if ids[offset] == token]
+            raise RuntimeError("The semantic language decoder returned no KV cache")
+        phrase = []
+        boxes = [] if views else None
+        view_index, coords = 0, []
+        separator = self._box_separator() if predict_boxes else None
+        # 自然语言只在 Gemma 文本词表内生成，保留 EOS；不使用示教候选子任务列表。
+        excluded = [i for i in self.specials if 0 <= i < GEMMA_TEXT_VOCAB and i != self.eos]
+        limit = min(self.model.config.tokenizer_max_length,
+                    self.language.config.max_position_embeddings - valid.shape[1] + 1)
+        for step in range(limit):
+            predicting_box = view_index < len(views)
+            vocab_end = GEMMA_TEXT_VOCAB + 1024 if predicting_box else GEMMA_TEXT_VOCAB
+            scores = self.head(hidden[:, -1].to(self.head.weight.dtype))[0, :vocab_end].float()
+            if not torch.isfinite(scores).all():
+                raise ValueError("Nonfinite semantic token scores")
+            if predicting_box:
+                # 仅约束输出格式。模型从当前图像学习框数与坐标，分隔符允许零个框。
+                k = len(coords)
+                lower = 0 if k < 2 else coords[k - 2] + 1
+                upper = 1023 if k < 2 else 1024
+                locations = scores[GEMMA_TEXT_VOCAB + lower:GEMMA_TEXT_VOCAB + upper]
+                best_score, best_index = locations.max(0)
+                if k == 0 and scores[separator] >= best_score:
+                    token = separator
+                    view_index += 1
+                else:
+                    coordinate = lower + best_index.item()
+                    coords.append(coordinate)
+                    token = GEMMA_TEXT_VOCAB + coordinate
+                    if len(coords) == 4:
+                        ymin, xmin, ymax, xmax = coords
+                        boxes.append({"view": views[view_index], "xyxy": [xmin/1023, ymin/1023, xmax/1023, ymax/1023]})
+                        coords.clear()
             else:
-                token = options[0]
-            if len(remaining) == 1:
-                break  # 余下 token（含 EOS）只剩唯一合法续写，无需重复运行冻结骨干。
-            offset += 1
-            tokens = torch.tensor([[token]], device=self.device)
+                scores[excluded] = -torch.inf
+                token = scores.argmax().item()
+                if token == self.eos:
+                    text = self.tokenizer.decode(phrase, skip_special_tokens=True).strip()
+                    if not text:
+                        raise SubtaskDecodeError("Generated an empty subtask")
+                    return (None if text == COMPLETE else text), boxes
+                phrase.append(token)
+            if step + 1 == limit:
+                break
+            ids = torch.tensor([[token]], device=self.device)
+            # 走同一个 embed_prefix 的纯文本分支，复用安装版本对语言 embedding 的缩放。
+            embed, _, _ = self.model.embed_prefix([], [], ids, torch.ones_like(ids, dtype=torch.bool))
             valid = F.pad(valid, (0, 1), value=True)
-            output = self.language(inputs_embeds=self.model.paligemma_with_expert.embed_language_tokens(tokens),
-                                   attention_mask=self._mask(valid[:, None, :]),
-                                   position_ids=valid.long().sum(dim=1, keepdim=True) - 1,
+            result = self.language(inputs_embeds=embed, attention_mask=self._mask(valid[:, None, :]),
+                                   position_ids=valid.long().sum(1, keepdim=True) - 1,
                                    past_key_values=cache, use_cache=True)
-            hidden, cache = output.last_hidden_state, output.past_key_values
-        return self.candidates[remaining[0]]
-
-    @classmethod
-    def from_checkpoint(cls, model, tokenizer, device, directory, model_dir, tokenizer_dir, image_keys, action_tasks):
-        """与动作检查点共用骨干和相机，严格加载独立的、已受监督的语言参数。"""
-        from safetensors.torch import load_file
-
-        directory = Path(directory)
-        cfg = read_json(directory / "adapter_config.json")
-        if cfg.get("format") != SEMANTIC_FORMAT or cfg.get("steps_completed", 0) <= 0:
-            raise ValueError("Expected a trained semantic checkpoint")
-        loader.validate_loader_compatibility(cfg)
-        if (cfg.get("base_config_sha256") != fingerprint(Path(model_dir) / "config.json")
-                or cfg.get("tokenizer_sha256") != fingerprint(Path(tokenizer_dir) / "tokenizer.json")):
-            raise ValueError("Semantic checkpoint base configuration or tokenizer differs")
-        if cfg.get("image_keys") != list(image_keys) or cfg.get("has_completion") is not True:
-            raise ValueError("Semantic checkpoint needs matching cameras and explicit completed-goal supervision")
-        instance = cls(model, tokenizer, cfg["rank"], cfg["alpha"], device)
-        instance.set_candidates(cfg["subtasks"])
-        unsupported = set(cfg["subtasks"]).difference(action_tasks)
-        if unsupported:
-            raise ValueError(f"Semantic subtasks absent from action checkpoint: {sorted(unsupported)}")
-        saved = load_file(str(directory / "trainable.safetensors"), device="cpu", backend="pread")
-        if any(not torch.isfinite(t).all() for t in saved.values()):
-            raise ValueError("Nonfinite semantic adapter weights")
-        instance.adapter.load_state_dict(saved, strict=True)
-        instance.adapter.eval().requires_grad_(False)
-        return instance
+            hidden, cache = result.last_hidden_state, result.past_key_values
+        raise SubtaskDecodeError("Generated subtask did not finish with EOS")
 
 
 class Pi05Policy:
-    """加载动作检查点及其训练统计，并按配置在同一骨干上进行高低层预测。"""
+    """加载联合检查点，在同一骨干上生成子任务和连续动作。"""
 
     def __init__(self, options):
         # PolicySession 的推理线程首次任务时创建；options 来自 policy_options。
         # 本类封装输入/权重适配；真正神经网络类定义在安装的 LeRobot modeling_pi05.py。
         from transformers import AutoTokenizer
-        from lerobot.policies.pi05 import processor_pi05
-        from .joint import JointPolicy
 
         self.options = options
         self.device = torch.device(f"cuda:{options['gpu']}")
@@ -507,81 +548,34 @@ class Pi05Policy:
             raise RuntimeError("Pi0.5 needs the installed CUDA LeRobot environment")
         torch.cuda.set_device(self.device)
         adapter = Path(options["adapter_dir"])
-        self.checkpoint = cfg = read_json(adapter / "adapter_config.json")
-        # 连续赋值：cfg 和 self.checkpoint 指向同一个 dict；read_json 将配置解析为 Python 对象。
-        # cfg 描述训练时的关节、统计、LoRA 配置等，权重张量则在另一个 safetensors 文件。
-        if cfg.get("dataset_fps") is not None and float(cfg["dataset_fps"]) != float(options["fps"]):
+        cfg = read_json(adapter / "adapter_config.json")
+        stats = adapter_statistics(cfg)
+        if float(cfg["dataset_fps"]) != float(options["fps"]):
             raise ValueError("The checkpoint dataset_fps differs from the service control rate")
-        joint = cfg.get("format") == JOINT_FORMAT
-        self.open_subtasks = joint and options["subtask_mode"] == "trained"
-        self.predicts_boxes = joint and bool(cfg.get("predicts_boxes"))
-        if not joint and cfg.get("format") != "friston_pi05_expert_lora_v1":
-            raise ValueError("Unsupported Pi0.5 adapter format")
-        if joint:
-            if not cfg.get("has_action_training"):
-                raise ValueError("This discrete-only checkpoint needs action post-training before deployment")
-            if cfg.get("tokenizer_sha256") != fingerprint(Path(options["tokenizer_dir"]) / "tokenizer.json"):
-                raise ValueError("Joint checkpoint text tokenizer differs")
-        elif options["subtask_mode"] == "trained" and Path(options["semantic_adapter_dir"]) == adapter:
-            raise ValueError("For a legacy action checkpoint, pass its separate --semantic-adapter-dir")
-        if cfg.get("joint_order") != [joint.removesuffix(".pos") for joint in ROBOT_JOINT_KEYS]:
-            raise ValueError("Adapter joint order differs from the robot")
-        if cfg.get("model_slots") != list(range(6)) or cfg.get("supervised_action_dims") != 6:
-            raise ValueError("Adapter action mapping differs from the robot")
-        loader.validate_loader_compatibility(cfg)
-        # 与续训共用相同的 loader 格式约定：检查加载格式版本，源码 SHA256 只用于新格式的追溯。
-        # 基础模型配置仍须与训练时一致；解除源码字节绑定不改变其他数据/模型检查。
-        path = Path(options["model_dir"]) / "config.json"
-        if fingerprint(path) != cfg["base_config_sha256"]:
-            raise ValueError(f"Checkpoint dependency differs: {path.name}")
+        self.predicts_boxes = cfg["predicts_boxes"]
+        self.has_completion = cfg["has_completion"]
+        if not cfg["has_action_training"]:
+            raise ValueError("This discrete-only checkpoint needs action post-training before deployment")
         with checkpoint_reader():
             # checkpoint_reader 是 models/weights.py 提供的权重读取上下文管理器，
             # with 进入时切换权重读取方式，退出时恢复；不是“在这里训练一次”。
             self.model, _ = loader.load_pi05_lowmem(
                 options["model_dir"], gpu=options["gpu"], gpu_layers=options["gpu_layers"],
                 chunk_mib=options["chunk_mib"])
-        targets = attach_trainables(self.model, int(cfg["rank"]), float(cfg["alpha"]))
-        # targets 是 attach_trainables 实际替换的动作专家层名。
+        attach_trainables(self.model, int(cfg["rank"]), float(cfg["alpha"]))
         # 先重建与训练一致的 LoRA/投影层，再把保存的增量参数放进同名参数槽。
-        if targets != cfg["target_modules"]:
-            raise ValueError("Adapter target modules differ")
         self.tokenizer = AutoTokenizer.from_pretrained(options["tokenizer_dir"], local_files_only=True)
         self.tokenizer.padding_side = "right"
-        if joint:
-            # 安装到与训练相同的骨干层；高层解码与 sample_actions 读取同一组适配后的 KV。
-            self.semantic = JointPolicy(self.model, self.tokenizer, cfg["rank"], cfg["alpha"], self.device)
-        # 按参数名把 LoRA 和四个投影层的增量权重复制到模型，保持设备映射。
+        self.joint_policy = JointPolicy(self.model, self.tokenizer, cfg["rank"], cfg["alpha"], self.device)
         load_adapter_weights(trainable_dict(self.model), adapter)
         self.model.eval().requires_grad_(False)
         # 链式调用：eval 返回模型自己，所以继续调用 requires_grad_ 冻结所有参数。
         # eval 切换模块的训练/推理行为，requires_grad_(False) 冻结参数梯度。
         # 两者与“全局禁止 autograd”不同；下方 guided RTC 仍需要内部求导。
         self.horizon = self.model.config.chunk_size
-        # horizon 是一个动作块的时间长度 int，例如50；不是去噪迭代次数。
-        if cfg["horizon"] != self.horizon:
-            raise ValueError("Adapter action horizon differs")
-        self.image_keys = cfg["image_keys"] if "image_keys" in cfg else [cfg["image_key"]]
-        self.semantic_image_keys = cfg.get("semantic_image_keys", self.image_keys)
-        if options["subtask_mode"] != "direct" and not self.open_subtasks:
-            self.subtasks = cfg.get("tasks") or [cfg.get("task")]
-            if not isinstance(self.subtasks, list) or not all(isinstance(s, str) and s.strip()
-                                                              for s in self.subtasks):
-                raise ValueError("High-level selection requires the action checkpoint's trained task labels")
-        self.stats = tuple(np.asarray(cfg["statistics"][key][quantile], dtype=np.float32)
+        self.stats = tuple(np.asarray(stats[key][quantile], dtype=np.float32)
                            for key in (STATE, ACTION) for quantile in ("q01", "q99"))
-        # 双层生成式按顺序得到四个 [6] 数组：状态q01、状态q99、动作q01、动作q99。
-        # np.asarray 将 JSON 里的数值列表转换为 NumPy 数组，便于逐元素计算。
-        if any(v.shape != (6,) or not np.isfinite(v).all() for v in self.stats):
-            raise ValueError("Adapter statistics must contain six finite values")
-        if any(np.any(hi <= lo) for lo, hi in (self.stats[:2], self.stats[2:])):
-            raise ValueError("Adapter quantile spans must be positive")
-        self.state_step = processor_pi05.Pi05PrepareStateTokenizerProcessorStep(
-            max_state_dim=self.model.config.max_state_dim)
-        # 这是 LeRobot processor_pi05.py 定义的可调用对象，负责把数值状态整理进 prompt。
-        if options["subtask_mode"] == "trained" and not joint:
-            self.semantic = SemanticPolicy.from_checkpoint(
-                self.model, self.tokenizer, self.device, options["semantic_adapter_dir"],
-                options["model_dir"], options["tokenizer_dir"], self.image_keys, self.subtasks)
+
         if options["rtc"]:
             from lerobot.policies.rtc.configuration_rtc import RTCConfig
             from lerobot.policies.rtc.modeling_rtc import RTCProcessor
@@ -589,16 +583,12 @@ class Pi05Policy:
             self.model.config.rtc_config = rtc
             self.model.rtc_processor = RTCProcessor(rtc)
 
-    def prepare_images(self, frames, image_keys=None):
-        """从同一次采集中选出该分支训练用的视角，再执行官方预处理。"""
+    def prepare_images(self, frames):
+        """用训练时相同的顺序预处理工作区和腕部图像。"""
         import cv2
 
-        keys = self.image_keys if image_keys is None else image_keys
-        rgb = {key: cv2.cvtColor(frames[key], cv2.COLOR_BGR2RGB) for key in keys}
-        images, masks = prepare_images(self.model, self.device, rgb)
-        # 真机只向模型传入有当前帧的视角。训练路径保留官方返回的 padding 视角和掩码。
-        valid = [(image, mask) for image, mask in zip(images, masks) if bool(mask.any())]
-        return [image for image, _ in valid], [mask for _, mask in valid]
+        rgb = {key: cv2.cvtColor(frames[key], cv2.COLOR_BGR2RGB) for key in POLICY_IMAGE_KEYS}
+        return prepare_images(self.model, self.device, rgb)
 
     def _normalized_state(self, observation):
         state = np.asarray([observation[k] for k in ROBOT_JOINT_KEYS], dtype=np.float32)
@@ -607,18 +597,15 @@ class Pi05Policy:
         lo, hi = self.stats[:2]
         return 2 * (state - lo) / (hi - lo) - 1
 
-    def select_subtask(self, frames, global_goal, observation=None, *, return_boxes=False):
-        images, masks = self.prepare_images(frames, self.semantic_image_keys)
-        if self.open_subtasks:
-            if observation is None:
-                raise ValueError("Joint subtask prediction requires the current robot observation")
-            state = self._normalized_state(observation)
-            camera_keys = self.semantic_image_keys if self.predicts_boxes else None
-            selected, boxes = self.semantic.predict_result(images, masks, global_goal, state, camera_keys)
-            if selected is None and not self.checkpoint["has_completion"]:
-                raise ValueError("Generated completion without any completion supervision in this checkpoint")
-            return (selected, boxes) if return_boxes else selected
-        return self.semantic.predict(images, masks, global_goal)
+    def select_subtask(self, frames, global_goal, observation):
+        """从最新双路图像、关节状态和总目标生成当前子任务及可选目标框。"""
+        images, masks = self.prepare_images(frames)
+        state = self._normalized_state(observation)
+        selected, boxes = self.joint_policy.predict_result(
+            images, masks, global_goal, state, predict_boxes=self.predicts_boxes)
+        if selected is None and not self.has_completion:
+            raise ValueError("此检查点中，在没有任何完成监督的情况下生成了完成状态。")
+        return selected, boxes
 
     def predict(self, frames, observation, task, previous=None, delay=0):
         """由 PolicySession 调用：相机+实测六关节+任务 -> H 步归一化/物理动作。
@@ -628,13 +615,11 @@ class Pi05Policy:
         """
 
         # 输入：frames 为视角键->BGR图像；observation 为六关节名->实测数值；task 为任务字符串。
-        # 默认场景理解路径通常把任务转为英文；关闭 ground_scene 时也可直接传入原始指令。
+        # task 为高层根据最新观测生成的子任务。
         # previous 为旧块尚未执行的归一化动作列表；delay 为估计推理期间会执行的帧数。
         normalized = self._normalized_state(observation)
         action_lo, action_hi = self.stats[2:]
-        # 单样本推理沿用动态文本长度，训练路径使用固定的 tokenizer_max_length。
-        tokens, text_mask = _encode_state_task(
-            self.model, self.device, normalized, task, self.tokenizer, padding=True, state_step=self.state_step)
+        tokens, text_mask = _encode_state_task(self.model, self.device, normalized, task, self.tokenizer)
         images, masks = self.prepare_images(frames)
         inputs = {"images": images, "img_masks": masks, "tokens": tokens, "masks": text_mask}
         kwargs = {}

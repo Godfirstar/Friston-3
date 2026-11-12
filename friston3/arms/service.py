@@ -19,7 +19,7 @@ import threading
 import time
 import uuid
 
-from .config import ARM_NAMES, GESTURES, JOINTS, load_config
+from .config import GESTURES, JOINTS, load_config
 # 开头的点表示从同一个 arms 包导入；这里导入的轨迹函数定义在 trajectories.py。
 from .trajectories import (check_compatibility, interpolate, load_motion, motion_catalog,
                            motion_summary, save_recording, validate_name, within_pose)
@@ -107,7 +107,7 @@ class ArmService:
             "duration_s", "hold_confirmed", "motion_saved", "limited", "arms",
             "instruction", "policy_status", "metrics", "scene", "task_success", "verification",
             "object_task_success_verified", "global_goal", "current_subtask",
-            "subtask_mode", "termination_reason") if key in job})
+            "termination_reason") if key in job})
 
     def status(self):
         # 返回控制线程最近更新的快照；HTTP 查询不会为了“最新”而自行访问串口。
@@ -257,7 +257,7 @@ class ArmService:
         # job 是一个 dict；保存接收时的 generation，后来可判断它是否已被取消。
         # uuid.uuid4().hex 生成任务编号字符串；它不同于标识“本次请求”的 request_id。
         if operation == "task":
-            job.update(instruction=instruction, global_goal=instruction, arm=arm, arms=[arm],
+            job.update(instruction=instruction, global_goal=None, arm=arm, arms=[arm],
                        object_task_success_verified=False)
         elif operation == "play":
             source = request.get("source", "manual")
@@ -450,7 +450,7 @@ class ArmService:
         snapshot = self._policy.status()
         with self._lock:
             for key in ("metrics", "scene", "instruction", "task_success", "verification",
-                        "global_goal", "current_subtask", "subtask_mode", "termination_reason"):
+                        "global_goal", "current_subtask", "termination_reason"):
                 if key in snapshot:
                     job[key] = deepcopy(snapshot[key])
             job["policy_status"] = snapshot.get("status", "running")

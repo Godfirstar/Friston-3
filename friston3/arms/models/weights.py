@@ -2,13 +2,12 @@
 
 由本模块 checkpoint_reader 临时接到 loader 的 safe_open 调用处；不是训练算法。
 读文件头确定 tensor 的形状/类型/偏移，再只申请本次切片的 bytearray。
-通过读取接口替换控制临时内存；loader.py 检查加载格式是否与检查点兼容。
+通过读取接口替换控制临时内存；loader.py 将实际权重与模型参数对应。
 """
 from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-import hashlib
 import json
 from math import prod
 import os
@@ -255,11 +254,6 @@ def read_json(path: Path) -> Any:
     # 【调用方】trainer/本模块的配置读取；Path来自pathlib，-> Any说明JSON结果类型可变。
     # read_text读成str；json.loads把JSON文本解析成dict/list等；utf-8-sig兼容文件头BOM。
     return json.loads(path.read_text(encoding='utf-8-sig'))
-
-
-def fingerprint(path: Path) -> str:
-    # 【调用方】adapter_statistics/保存checkpoint；按原始字节算SHA256字符串作一致性标识。
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 _checkpoint_reader_lock = RLock()

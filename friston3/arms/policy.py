@@ -9,82 +9,50 @@ from __future__ import annotations
 # 相机采集线程按需导入 OpenCV，模型工作线程按需导入 π₀.₅。
 from collections import deque
 from copy import deepcopy
-import json
 import math
 from pathlib import Path
 import threading
 import time
 
-from .config import JOINT_FORMAT, JOINTS
-
-
-def __getattr__(name):
-    # 保留已有的显式导入路径，读取策略配置或创建会话时仍可只用标准库。
-    if name == "Pi05Policy":
-        from .models.pi05 import Pi05Policy
-        return Pi05Policy
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+from .config import JOINTS, policy_cameras
 
 
 def policy_options(config):
     # PolicySession.__init__ 调用；输入服务配置 dict，返回合并默认值后的策略配置 dict。
-    from .models import assets_root, resolve_asset_path
+    from .models import assets_root
 
     root = assets_root()
     # root 是 pathlib.Path，/ 在这里拼接路径。
     options = {
         "model_dir": str(root / "pi05_base"),
         "tokenizer_dir": str(root / "paligemma_tokenizer"),
-        "adapter_dir": str(root / "checkpoints" / "step80"),
-        "cameras": {"observation.images.base_0_rgb": 0,
-                    "observation.images.right_wrist_0_rgb": 1},
         "camera_backend": "dshow", "camera_timeout": 10.0,
         "gpu": 0, "gpu_layers": 8, "chunk_mib": 64.0,
-        "num_steps": 10, "cycles": 50, "rtc": True,
-        "blend_steps": 8, "ground_scene": True, "verify_scene": True,
-        "subtask_mode": "direct", "replan_steps": 50, "semantic_adapter_dir": None,
+        "num_steps": 10, "cycles": 50, "rtc": False, "blend_steps": 8,
+        "replan_steps": None,
+        "trained_goal_language": "en",
         "fps": config.get("fps", 20.0),
     }
-    provided = config.get("policy", {})
-    options.update(provided)
-    # dict.get 第二个参数是缺省值；update 用用户配置覆盖同名默认项。
-    # 配置可能仍保存迁移前的绝对路径；仅定位新根下同名资产，不选择别的检查点。
+    options.update(config.get("policy", {}))
+    if not options.get("adapter_dir"):
+        raise ValueError("请为策略设置 policy.adapter_dir，或使用 serve --adapter-dir 指定本次训练的 checkpoint 目录。")
     for key in ("model_dir", "tokenizer_dir", "adapter_dir"):
-        options[key] = str(resolve_asset_path(options[key]))
-    action_dir = Path(options["adapter_dir"])
-    metadata_file = action_dir / "adapter_config.json"
-    metadata = {}
-    if metadata_file.is_file() or options["subtask_mode"] == "trained":
-        metadata = json.loads(metadata_file.read_text(encoding="utf-8-sig"))
-    options["checkpoint_format"] = metadata.get("format")
-    joint = options["checkpoint_format"] == JOINT_FORMAT
-    if joint:
-        if "subtask_mode" not in provided:
-            options["subtask_mode"] = "trained"
-        if "rtc" not in provided:
-            options["rtc"] = False
-        if "replan_steps" not in provided:
-            # 每两个完整动作块复看一次；论文只规定高层频率较低，具体帧数可覆盖。
-            options["replan_steps"] = 2 * int(metadata["horizon"])
-    if options["subtask_mode"] not in ("direct", "external", "trained"):
-        raise ValueError("policy.subtask_mode must be direct, external or trained")
-    if options["subtask_mode"] == "trained":
-        if joint:
-            directory = action_dir
-        elif options["semantic_adapter_dir"]:
-            directory = resolve_asset_path(options["semantic_adapter_dir"])
-        else:
-            raise ValueError("Legacy action checkpoint requires a separate --semantic-adapter-dir in trained mode")
-        for filename in ("adapter_config.json", "trainable.safetensors"):
-            if not (directory / filename).is_file():
-                raise FileNotFoundError(f"Missing trained semantic checkpoint file: {directory / filename}")
-        options["semantic_adapter_dir"] = str(directory)
+        options[key] = str(Path(options[key]).expanduser().resolve())
+    metadata_file = Path(options["adapter_dir"]) / "adapter_config.json"
+    if not metadata_file.is_file():
+        raise FileNotFoundError(f"找不到 {metadata_file}。请更新 policy.adapter_dir，或使用 serve --adapter-dir 指定新 checkpoint。")
+    if options["trained_goal_language"] not in ("en", "original"):
+        raise ValueError("policy.trained_goal_language must be en or original")
+    options["cameras"] = policy_cameras(config)
     if float(options["fps"]) != float(config.get("fps", 20.0)):
         raise ValueError("policy.fps must match the arm service fps; configure the service control rate")
     for key in ("fps", "camera_timeout", "chunk_mib"):
         if not math.isfinite(float(options[key])) or float(options[key]) <= 0:
             raise ValueError(f"policy.{key} must be finite and positive")
-    for key in ("num_steps", "cycles", "blend_steps", "replan_steps"):
+    positive_integers = ["num_steps", "cycles", "blend_steps"]
+    if options["replan_steps"] is not None:
+        positive_integers.append("replan_steps")
+    for key in positive_integers:
         if type(options[key]) is not int or options[key] < 1:
             raise ValueError(f"policy.{key} must be a positive integer")
     return options
@@ -190,7 +158,6 @@ class PolicySession:
     def __init__(self, config, *, policy_factory=None, camera_factory=None):
         # ArmService._start_job 创建此对象；factory 是“可调用的构造函数/类”，不是已加载模型。
         self.options = policy_options(config)
-        self._full_chunks = self.options["checkpoint_format"] == JOINT_FORMAT and not self.options["rtc"]
         self._policy_factory = policy_factory
         self._camera_factory = camera_factory or CameraRig
         # 注入工厂可换成假相机/假模型，验证队列与取消逻辑时无需加载大模型或连接设备。
@@ -235,8 +202,8 @@ class PolicySession:
             self._last_send = self._first_send = None
             self._status = {"status": "loading", "message": "正在读取场景并准备策略。",
                             "instruction": instruction, "arm": arm, "scene": {},
-                            "global_goal": instruction, "current_subtask": None,
-                            "subtask_mode": self.options["subtask_mode"], "termination_reason": None,
+                            "global_goal": None, "current_subtask": None,
+                            "termination_reason": None,
                             "metrics": {"commands": 0, "chunks": 0, "max_send_gap_s": 0.0,
                                         "queue_empty_ticks": 0}, "task_success": None}
             self._condition.notify_all()
@@ -313,7 +280,7 @@ class PolicySession:
 
     def _review_due(self):
         # 发送帧数只决定何时再看图；只有高层读过新图后才有完成/切换结论。
-        return self.options["subtask_mode"] != "direct" and self._acknowledged >= self._next_review
+        return self._acknowledged >= self._next_review
 
     def _next_work(self):
         """在 Condition 锁内决定下一次模型工作；None 表示等待 owner 的通知。"""
@@ -323,10 +290,10 @@ class PolicySession:
         if self._review_due() or (exhausted and not self._queue):
             if self._acknowledged != self._sent or (self._sent and self._state_clock <= self._last_ack):
                 return None
-            return "finish" if self.options["subtask_mode"] == "direct" else "review"
+            return "review"
         if exhausted:
             return None
-        if self._full_chunks:
+        if not self.options["rtc"]:
             # 用下一次真实观察生成新动作块；同一动作块逐帧按次序发送。
             if self._queue or self._acknowledged != self._sent or (self._sent and self._state_clock <= self._last_ack):
                 return None
@@ -336,26 +303,15 @@ class PolicySession:
         refill = math.ceil(latency * self.options["fps"]) + 4
         return "predict" if len(self._queue) <= refill else None
 
-    def _prepare(self, policy, camera, generation, global_goal):
-        scene = {}
-        current_subtask = None
-        if self.options["subtask_mode"] == "direct":
-            current_subtask = global_goal
-            if self.options["ground_scene"]:
-                from .scene import ground_task
-                frames, _ = camera.read()
-                scene_options = dict(self.options)
-                scene_options.setdefault("scene_num_gpu", -1 if policy is None else 0)
-                scene = ground_task(global_goal, frames, scene_options)
-                current_subtask = scene["task"]
-        elif self.options["subtask_mode"] == "trained":
-            scene = {"assessment": "trained_semantic_policy",
-                     "checkpoint": self.options["semantic_adapter_dir"],
-                     "capability_validation": "子任务与完成信号来自模型预测；本服务未验证该检查点的真机成功率。"}
+    def _prepare(self, policy, generation, instruction):
+        global_goal = instruction
+        if self.options["trained_goal_language"] == "en":
+            from .scene import translate_goal
+            global_goal = translate_goal(instruction, self.options)
         with self._condition:
             if not self._current(generation):
                 return policy
-            self._status.update(scene=scene, message="正在加载策略。")
+            self._status.update(global_goal=global_goal, message="正在加载策略。")
         if policy is None:
             from .scene import release_dialogue_gpu
             release_dialogue_gpu(self.options)
@@ -365,33 +321,17 @@ class PolicySession:
             policy = self._policy_factory(self.options)
         with self._condition:
             if self._current(generation):
-                self._status.update(status="running", current_subtask=current_subtask,
-                                    message="策略已加载，正在读取当前观测。")
+                self._status.update(status="running", message="策略已加载，正在读取当前观测。")
         return policy
 
     def _review(self, policy, camera, generation, global_goal, current_subtask, last_ack):
         # tick 在观察期间暂停出队。每路图像都来自上次确认发送之后，此时也有新的关节读回。
         frames, _ = camera.read(newer_than=last_ack)
-        mode = self.options["subtask_mode"]
-        free_text = mode == "trained" and getattr(policy, "open_subtasks", False)
-        boxes = None
-        if mode == "external":
-            from .scene import select_subtask
-            selected = select_subtask(global_goal, current_subtask, frames, self.options, policy.subtasks)
-        elif free_text:
-            # _next_work 已等到最后一帧执行后的关节读回；与本次相机帧配对。
-            with self._condition:
-                if not self._current(generation):
-                    return
-                observation = dict(self._state)
-            if getattr(policy, "predicts_boxes", False):
-                selected, boxes = policy.select_subtask(frames, global_goal, observation, return_boxes=True)
-            else:
-                selected = policy.select_subtask(frames, global_goal, observation)
-        else:
-            selected = policy.select_subtask(frames, global_goal)
-        if selected is not None and not free_text and selected not in policy.subtasks:
-            raise ValueError(f"Subtask has no action training label: {selected!r}")
+        with self._condition:
+            if not self._current(generation):
+                return
+            observation = dict(self._state)
+        selected, boxes = policy.select_subtask(frames, global_goal, observation)
         with self._condition:
             if not self._current(generation):
                 return
@@ -405,36 +345,20 @@ class PolicySession:
                 self._status["scene"]["subtask_boxes"] = boxes
             else:
                 self._status["scene"].pop("subtask_boxes", None)
-            self._next_review = self._acknowledged + self.options["replan_steps"]
+            interval = self.options["replan_steps"] or 2 * policy.horizon
+            self._next_review = self._acknowledged + interval
             if selected is None:
                 self._status.update(status="completed", termination_reason="goal_complete", task_success=True,
-                                    verification={"assessment": f"{mode}_subtask_prediction", "success": True},
+                                    verification={"assessment": "trained_subtask_prediction", "success": True},
                                     message="高层策略根据最新观测判断总目标已完成。")
             elif self._predictions >= self.options["cycles"] and not self._queue:
                 self._status.update(status="completed", termination_reason="budget_exhausted",
                                     message="动作块预算已耗尽，高层仍预测有待执行的子任务。")
             self._condition.notify_all()
 
-    def _finish_direct(self, camera, generation, global_goal, last_ack):
-        verification = {"success": None, "evidence": "尚未验证抓取结果。"}
-        if self.options["verify_scene"]:
-            from .scene import inspect_completion
-            frames, _ = camera.read(newer_than=last_ack)
-            with self._condition:
-                if not self._current(generation):
-                    return
-                before = self._status["scene"]
-            verification = inspect_completion(global_goal, before, frames, self.options)
-        with self._condition:
-            if self._current(generation):
-                detail = verification.get("fact") or verification.get("uncertainty") or "尚未验证取物结果。"
-                self._status.update(status="completed", termination_reason="budget_exhausted",
-                                    task_success=verification.get("success"), verification=verification,
-                                    message="策略执行周期结束。" + detail)
-
     def _predict(self, policy, camera, generation, current_subtask, last_ack):
         began = time.perf_counter()
-        frames, ages = camera.read(newer_than=last_ack) if self._full_chunks else camera.read()
+        frames, ages = camera.read() if self.options["rtc"] else camera.read(newer_than=last_ack)
         with self._condition:
             if not self._current(generation) or self._review_due():
                 return
@@ -476,6 +400,7 @@ class PolicySession:
                         self._condition.wait()
                         continue
                     generation = self._generation
+                    instruction = self._status.get("instruction")
                     global_goal = self._status.get("global_goal")
                     current_subtask = self._status.get("current_subtask")
                     last_ack = self._last_ack
@@ -486,21 +411,13 @@ class PolicySession:
                 try:
                     if work == "prepare":
                         if camera is None:
-                            metadata = json.loads((Path(self.options["adapter_dir"]) / "adapter_config.json")
-                                                  .read_text(encoding="utf-8-sig"))
-                            keys = metadata["image_keys"] if "image_keys" in metadata else [metadata["image_key"]]
-                            if self.options["subtask_mode"] == "trained" and metadata.get("format") == JOINT_FORMAT:
-                                keys = dict.fromkeys([*keys, *metadata.get("semantic_image_keys", keys)])
-                            mappings = {key: self.options["cameras"][key] for key in keys}
-                            camera = self._camera_factory(mappings, self.options["camera_backend"],
+                            camera = self._camera_factory(self.options["cameras"], self.options["camera_backend"],
                                                           self.options["camera_timeout"])
-                        policy = self._prepare(policy, camera, generation, global_goal)
+                        policy = self._prepare(policy, generation, instruction)
                     elif work == "review":
                         self._review(policy, camera, generation, global_goal, current_subtask, last_ack)
-                    elif work == "predict":
-                        self._predict(policy, camera, generation, current_subtask, last_ack)
                     else:
-                        self._finish_direct(camera, generation, global_goal, last_ack)
+                        self._predict(policy, camera, generation, current_subtask, last_ack)
                 except Exception as error:
                     # 将模型/相机故障发给 ArmService 的错误与持姿路径；过期错误不得结束新任务。
                     with self._condition:

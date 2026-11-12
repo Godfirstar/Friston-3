@@ -9,7 +9,11 @@ from pathlib import Path
 import re
 import secrets
 
-JOINT_FORMAT = "friston_pi05_joint_v1"
+JOINT_FORMAT = "friston_pi05_joint_v3"
+POLICY_IMAGE_KEYS = (
+    "observation.images.base_0_rgb",
+    "observation.images.right_wrist_0_rgb",
+)
 JOINTS = tuple(name + ".pos" for name in (
     "shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"))
 # tuple(...)消费生成器，为每个关节名加.pos后得到固定顺序元组；策略张量/驱动均沿用此顺序。
@@ -18,6 +22,17 @@ STATE, ACTION = "observation.state", "action"
 ARM_NAMES = ("left", "right")
 GESTURES = ("rest", "wave", "welcome", "point_pickup", "shrug")
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$")
+
+
+def policy_cameras(config: dict) -> dict:
+    """录制和部署共用的相机视角名与 OpenCV 设备编号。"""
+    cameras = config.get("policy", {}).get("cameras", dict(zip(POLICY_IMAGE_KEYS, (0, 1))))
+    if not isinstance(cameras, dict) or set(cameras) != set(POLICY_IMAGE_KEYS):
+        raise ValueError(f"策略需要工作区和右腕两路相机：{', '.join(POLICY_IMAGE_KEYS)}")
+    indices = [cameras[key] for key in POLICY_IMAGE_KEYS]
+    if any(type(index) is not int or index < 0 for index in indices) or indices[0] == indices[1]:
+        raise ValueError("两路相机必须使用不同的非负整数设备编号")
+    return dict(zip(POLICY_IMAGE_KEYS, indices))
 
 
 def default_config_path() -> Path:

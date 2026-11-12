@@ -9,24 +9,20 @@
 安装的 lerobot.policies.pi05.modeling_pi05 中，不在本文件重写。
 阅读顺序：load_pi05_lowmem → build_meta_model → plan_sources → stream_load。
 
-相机/图片输入、合成输入、推理计时和诊断命令行现集中在 diagnostics.py：
-    python -m friston3.arms.models.diagnostics --help
-旧的 python -m friston3.arms.learning.loader 及显式诊断函数导入继续可用。
 """
 from __future__ import annotations
 
+import json
+import struct
+import time
 from collections import defaultdict
 from contextlib import ExitStack
 from dataclasses import dataclass
-import hashlib
-import json
 from math import prod
 from pathlib import Path
-import struct
-import sys
-import time
 from types import SimpleNamespace
 from typing import Any
+
 # 本模块导入时只加载标准库；Torch/LeRobot 在实际建模或装载时才导入。
 
 
@@ -38,52 +34,6 @@ LANG = f"{PALI}.model.language_model"
 EXPERT = f"{ROOT}.gemma_expert"
 # ROOT/PALI/LANG/EXPERT 都是模型内部模块的名称字符串，不是模型对象。
 # f"{变量}..." 是格式化字符串；这些前缀稍后用来定位 state_dict 中的权重和设备映射。
-
-
-LOADER_CONTRACT = "friston_pi05_streaming_v1"
-# 模块级常量：v1 保持现有权重键映射、形状/类型解释和共享参数装载语义。
-# CPU/GPU 层数和分块大小属于运行配置，不因这些配置或源码注释变化而升级版本。
-
-_LEGACY_V1_LOADER_SHA256 = "9316c67dcd649da122a4f05549beade5ce7c6b96452f3d45de1f29e9a1f4acf6"
-# 这是引入版本字段前 loader.py 的实际原始字节指纹，已核对本地 27 个旧检查点。
-# 后续注释与模块拆分保留 v1 的权重解释；旧检查点仍按这一已知历史格式加载。
-# 这个固定值标识历史实现，不应随着当前文件的注释修改重新计算或替换。
-
-
-def loader_metadata() -> dict[str, str]:
-    """由 trainer.save_checkpoint 调用，返回应写入 adapter_config.json 的两项信息。"""
-    # __file__ 是模块的源码路径；read_bytes 读小型 Python 文件，完全不读模型权重。
-    # SHA256 仍记录精确源码，用于追溯实验；新格式加载时不要求这个值等于当前源码。
-    source_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-    return {"loader_contract": LOADER_CONTRACT, "loader_sha256": source_sha256}
-
-
-def validate_loader_compatibility(config: dict) -> None:
-    """部署 Pi05Policy 和续训 adapter_statistics 调用；兼容则返回，否则抛 ValueError。
-
-    config 是读取 adapter_config.json 得到的字典。这里只判断加载格式；关节顺序、
-    基础模型配置、动作形状和归一化统计仍由各自现有检查负责。本函数不修改 config。
-    """
-    if "loader_contract" in config:
-        # in 检查键是否存在：新格式即使填了 null/未知版本，也不能退回旧指纹分支。
-        contract = config["loader_contract"]
-    elif config.get("loader_sha256") == _LEGACY_V1_LOADER_SHA256:
-        # 没有版本字段的旧格式：将已知历史实现识别为 v1，无需改写旧检查点文件。
-        contract = "friston_pi05_streaming_v1"
-        # 必须固定为历史 v1，不能赋 LOADER_CONTRACT；未来升级时旧文件不能自动冒充新版。
-    else:
-        raise ValueError(
-            "Legacy checkpoint has no loader_contract and an unrecognized loader_sha256. "
-            "Verify its original loader before migrating; a source hash alone cannot "
-            "establish compatibility with this runtime."
-        )
-    if contract != LOADER_CONTRACT:
-        raise ValueError(
-            f"Unsupported loader_contract: {contract!r}; "
-            f"this runtime supports {LOADER_CONTRACT!r}. "
-            "Use a compatible loader or explicitly migrate the checkpoint."
-        )
-    # 正常走到函数末尾自动返回 None；新旧文件统一检查版本，源码 SHA256 不与当前文件比较。
 
 
 @dataclass(frozen=True)
@@ -430,7 +380,7 @@ def stream_load(model: Any, sources: list[Source], device_map: dict[str, Any],
 def load_pi05_lowmem(model_dir: str | Path, device_map: dict[str, Any] | None = None,
                      gpu: int = 0, gpu_layers: int = 4, chunk_mib: float = 64.0):
     """Return (dispatched core model, loading report). Do not call model.to()."""
-    # 【调用方】pi05.Pi05Policy 与 diagnostics.main；这是部署/诊断的完整加载组织函数。
+    # 【调用方】pi05.Pi05Policy这是部署的完整加载组织函数。
     # 输入本地权重目录、可选设备表、GPU编号/层数/分块大小，返回(model, report)二元组。
     # 训练路径不会直接复用这一整套dispatch：trainer.py 需要为冻结前缀和可训练专家分别安排梯度。
     import torch
@@ -473,40 +423,3 @@ def load_pi05_lowmem(model_dir: str | Path, device_map: dict[str, Any] | None = 
                   after_load=snapshot(device))
     print("LOAD_OK", json.dumps(report["after_load"]), flush=True)
     return model, report
-
-
-# 旧代码可能从 loader 显式导入这些诊断工具；实际定义已搬到 diagnostics。
-# __getattr__ 是 Python 模块的延迟属性入口：仅在访问旧名称时导入诊断模块。
-# 返回原函数/类对象，不另建一份 RamMonitor 类，也不复制加载函数或修改其全局变量。
-_DIAGNOSTIC_EXPORTS = frozenset({
-    "RamMonitor", "cache_summary", "resolve_visual_sources", "read_visual_inputs",
-    "prepare_inputs", "infer_once", "parse_args",
-})
-
-
-def __getattr__(name: str):
-    if name in _DIAGNOSTIC_EXPORTS:
-        from . import diagnostics
-        return getattr(diagnostics, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-def __dir__():
-    # 让 dir(loader) 仍能发现旧的显式导入入口，便于交互式查看和 IDE 检索。
-    return sorted(set(globals()) | _DIAGNOSTIC_EXPORTS)
-
-
-def main():
-    """兼容旧命令；诊断的输入、计时和报告流程统一由 diagnostics.main 执行。"""
-    from .diagnostics import main as diagnostic_main
-    return diagnostic_main()
-
-
-if __name__ == "__main__":
-    # -m 会把当前文件执行为 __main__；旧的直接脚本执行还没有包上下文。
-    # 先登记同一模块的规范名称，再加载 diagnostics，避免它又导入第二份 loader。
-    if not __package__:
-        sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-        __package__ = "friston3.arms.models"
-    sys.modules.setdefault(f"{__package__}.loader", sys.modules[__name__])
-    main()

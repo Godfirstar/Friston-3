@@ -117,16 +117,12 @@ def _arguments(argv=None):
         child = commands.add_parser(name, help=help_text)
         _shared_options(child)
         if name == "serve":
-            child.add_argument("--subtask-mode", choices=("direct", "external", "trained"),
-                               help="整任务、外部视觉模型或受训语义策略")
-            child.add_argument("--semantic-adapter-dir", help="旧版独立语义检查点目录")
-            child.add_argument("--adapter-dir", "--action-adapter-dir", dest="adapter_dir",
-                               help="联合检查点或旧版动作检查点目录")
+            child.add_argument("--trained-goal-language", choices=("en", "original"),
+                               help="总目标语言：en 将中文整句译成英文（默认），original 保留原话")
+            child.add_argument("--adapter-dir", help="联合训练生成的检查点目录")
             child.add_argument("--replan-steps", type=int, help="两次语义观察之间确认发送的动作帧数")
             child.add_argument("--rtc", action=argparse.BooleanOptionalAction, default=None,
                                help="动作块之间使用 RTC 引导；联合检查点默认逐块执行")
-            child.add_argument("--no-ground-scene", dest="ground_scene", action="store_false", default=None,
-                               help="direct 模式将 task 原文直接交给动作策略，可用于人工子任务对照")
         if name == "shutdown":
             # --no-wait 对应 args.no_wait；type=函数名 将转换函数交给 argparse 稍后调用。
             child.add_argument("--no-wait", action="store_true", help="只显示关闭请求的接收结果")
@@ -208,6 +204,8 @@ def _emit(result: dict, *, as_json: bool = False) -> None:
                        ("任务", finished_job)):
         if isinstance(job, dict) and job.get("kind") == "task":
             print(f"{label}策略任务：{job.get('instruction', '')}", flush=True)
+            if job.get("global_goal") and job["global_goal"] != job.get("instruction"):
+                print(f"  策略总目标：{job['global_goal']}", flush=True)
             print(f"  {job.get('policy_status', job.get('status', ''))}：{job.get('message', '')}", flush=True)
             if job.get("current_subtask"):
                 print(f"  当前子任务：{job['current_subtask']}", flush=True)
@@ -380,7 +378,7 @@ def main(argv=None) -> int:
             from .service import serve
             # 此分支进入长期运行的服务；不同于后面的客户端查询，它会持有硬件工作线程。
             policy = {key: getattr(args, key) for key in (
-                "subtask_mode", "semantic_adapter_dir", "adapter_dir", "replan_steps", "ground_scene", "rtc")
+                "trained_goal_language", "adapter_dir", "replan_steps", "rtc")
                 if getattr(args, key) is not None}
             outcome = serve(args.config, policy_overrides=policy)
             # 某些结束路径未显式返回整数时使用 0；type(... ) is int 排除 bool 被当作退出码。

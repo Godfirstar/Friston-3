@@ -6,6 +6,7 @@ import re
 # 相邻的两个字符串在括号里会自动拼接；_HAN 保存字符范围描述，不是某个输入句子。
 _HAN = (r'\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff'
         r'\U00020000-\U0002fa1f\U00030000-\U000323af')
+HAN_CHARACTER = re.compile('[' + _HAN + ']')
 _HAN_TOKEN_SPACE = re.compile(r'(?<=[' + _HAN + r'])\s+(?=[' + _HAN + r'])')
 # compile() 返回可复用的模式对象；(?<=...)看左侧，(?=...)看右侧，它们本身不吞掉字符。
 # 此模式只匹配左右都是汉字的一个或多个空白，之后的 sub('', text) 仅删除这些空白。
@@ -16,12 +17,15 @@ _MEMORY_PREFIX = re.compile(r'^(?:记住|忘记)\s*[:：]')
 # 调用方：main、Agent.handle、NpcTalkSkill；输出规范化记录字典，不进行语义改写或查库。
 # * 后的 input_source 必须按名字传参；默认'text'表示键盘输入。
 def prepare_input_text(text, *, input_source='text'):
-    """Retain the raw input and produce a format-normalized working copy.
+    """保留原始输入并生成格式规范化的工作副本。
 
-    Some ASR decoders delimit Chinese tokens with spaces. Join only whitespace
-    between two Han characters. English word boundaries, digits, punctuation,
-    negation and the recognized characters themselves are preserved. Keyboard
-    input is only stripped at its outer boundary, as before.
+某些 ASR 解码器使用空格分隔中文字符。仅连接两个汉字之间的空格。
+
+英文单词边界、数字、标点符号、
+
+否定符号以及识别出的字符本身均被保留。键盘输入
+
+仅在其外部边界处进行剥离，与之前相同。
     """
     if not isinstance(text, str):
         raise TypeError('输入必须是文字')
@@ -37,6 +41,6 @@ def prepare_input_text(text, *, input_source='text'):
 
 
 def is_memory_command(text):
-    """Recognize the existing colon-delimited protocol, including its spacing."""
+    """识别现有的冒号分隔协议，包括其空格。"""
     # main/Agent直接调用；match返回匹配对象或None，bool把它转成True/False，供分支判断。
     return bool(_MEMORY_PREFIX.match(text))

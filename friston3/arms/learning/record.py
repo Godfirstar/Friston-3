@@ -13,10 +13,8 @@ from pathlib import Path
 from threading import RLock, Thread
 import time
 
-from ..models import assets_root, resolve_asset_path
-from ..config import load_config
-# .表示当前learning包；..回到父包arms，因此load_config定义在arms/config.py。
-# assets_root/resolve_asset_path定义在learning/__init__.py，统一定位模型与数据资产。
+from ..config import load_config, policy_cameras
+from ..models import assets_root
 
 
 def parse_args(argv=None):
@@ -32,16 +30,18 @@ def parse_args(argv=None):
     parser.add_argument("--follower-id")
     parser.add_argument("--leader-port")
     parser.add_argument("--leader-id")
-    parser.add_argument("--task", required=True, help="Task actually demonstrated in these episodes")
+    parser.add_argument("--task", required=True,
+                        help="Overall demonstrated goal; annotate frame ranges in meta/subtasks.json after recording")
     # required=True要求提供任务文本；PowerShell中带空格的文本需用引号作为一个参数。
     parser.add_argument("--camera", action="append", metavar="KEY=INDEX",
                         help="Repeat for each view; default DirectShow base_0_rgb=0 and right_wrist_0_rgb=1")
     # append表示该选项可重复，每次值追加到args.camera列表；不是后一次覆盖前一次。
     # 例如--camera base_0_rgb=0 --camera right_wrist_0_rgb=1；具体索引以当前配置/枚举为准。
-    parser.add_argument("--camera-backend", choices=("any", "msmf", "dshow"), default="dshow")
+    parser.add_argument("--camera-backend", choices=("any", "msmf", "dshow"),
+                        help="Override policy.camera_backend (default: dshow)")
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
-    parser.add_argument("--fps", type=int, default=20)
+    parser.add_argument("--fps", type=int, help="Override the arm control rate (default: 20)")
     parser.add_argument("--episodes", type=int, default=10)
     parser.add_argument("--episode-seconds", type=float, default=60)
     parser.add_argument("--reset-seconds", type=float, default=10)
@@ -58,7 +58,8 @@ def parse_args(argv=None):
     if not args.task.strip():
         # str.strip去除首尾空白；空字符串在if中为False，not反转为True。
         parser.error("--task must describe the demonstration")
-    if min(args.width, args.height, args.fps, args.episodes, args.episode_seconds) <= 0 or args.reset_seconds < 0:
+    if (min(args.width, args.height, args.episodes, args.episode_seconds) <= 0 or args.reset_seconds < 0
+            or (args.fps is not None and args.fps <= 0)):
         parser.error("Dimensions, fps, episode count and duration must be positive")
     if args.resume and args.root is None:
         parser.error("--resume requires the existing dataset --root")
@@ -67,14 +68,13 @@ def parse_args(argv=None):
     if args.root is None:
         args.root = assets_root() / "datasets" / ("so101_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
         # Path的/拼路径；strftime把当前时间格式化为目录名；这里只算路径，不开始录制。
-    # 续写定位已迁移的旧数据集；新建录制始终尊重用户明确指定的输出路径。
-    args.root = resolve_asset_path(args.root) if args.resume else args.root.expanduser().resolve()
+    args.root = args.root.expanduser().resolve()
     return args
 
 
 def build_config(args):
     # 【调用方】main；args来自parse_args，返回官方LeRobot RecordConfig配置对象。
-    # 下游是arms.config.load_config、policy_options，以及LeRobot各配置类构造函数。
+    # 相机、控制频率与端口取自机械臂配置，录制无需训练 checkpoint。
     # 配置对象只描述怎样连接/保存；实际连接由后面的record_demonstrations进行。
     # 参数优先级：本次 CLI 明确值 > 机械臂配置；相机键名还要与训练/推理保持一致。
     from lerobot.cameras.opencv import OpenCVCameraConfig
@@ -106,26 +106,29 @@ def build_config(args):
                 # CLI明确传值时覆盖这份本次配置；destination是follower/leader字典的引用。
             if not destination.get(field):
                 raise ValueError(f"Configure {prefix} {field} or supply --{prefix}-{field}")
-    cameras = {}
-    # 未来的{相机键名: OpenCVCameraConfig实例}，不是图像帧字典。
-    backend = {"any": 0, "msmf": 1400, "dshow": 700}[args.camera_backend]
-    # 字典字面量建立名字→OpenCV后端编号映射，紧接[]按用户所选名字取一个值。
-    from ..policy import policy_options
-    mappings = policy_options(config)["cameras"]
-    # policy_options定义在arms/policy.py，补齐机械臂策略的默认选项；取其中相机映射。
-    specifications = args.camera or [f"{key}={index}" for key, index in mappings.items()]
-    # 有CLI相机列表就使用它；否则列表推导把配置映射转成相同KEY=INDEX文本格式。
-    for specification in specifications:
-        key, separator, index = specification.partition("=")
-        # str.partition只按第一个=切成三个字符串；没有=时separator为空，用来识别格式错误。
-        key = key.removeprefix("observation.images.")
-        # 去除可选公共前缀；录制配置使用base_0_rgb，数据feature保存时再有完整前缀。
-        if not separator or not key or key in cameras:
-            raise ValueError("Each camera needs a unique KEY=INDEX")
-        cameras[key] = OpenCVCameraConfig(index_or_path=int(index), fps=args.fps,
-                                        width=args.width, height=args.height, backend=backend)
-        # 实例化官方相机配置；int把索引文本转整数；命名参数明确每个值的用途。
-        # 这是描述分辨率/帧率/设备的对象，此行不等于已经取得一帧画面。
+    backend_name = args.camera_backend or config.get("policy", {}).get("camera_backend", "dshow")
+    backend = {"any": 0, "msmf": 1400, "dshow": 700}[backend_name]
+    fps = args.fps if args.fps is not None else config.get("fps", 20)
+    if int(fps) != fps:
+        raise ValueError("LeRobot recording requires an integer fps; set --fps explicitly")
+    fps = int(fps)
+    if args.camera:
+        overrides = {}
+        for specification in args.camera:
+            key, separator, index = specification.partition("=")
+            key = "observation.images." + key.removeprefix("observation.images.")
+            if not separator or key in overrides:
+                raise ValueError("--camera requires a unique KEY=INDEX for each view")
+            overrides[key] = int(index)
+        camera_indices = policy_cameras({"policy": {"cameras": overrides}})
+    else:
+        camera_indices = policy_cameras(config)
+    # LeRobot 的录制配置使用短名；写入 features 时会自动补上 observation.images. 前缀。
+    cameras = {
+        key.removeprefix("observation.images."): OpenCVCameraConfig(
+            index_or_path=index, fps=fps, width=args.width, height=args.height, backend=backend)
+        for key, index in camera_indices.items()
+    }
     for definition in (follower, leader):
         if definition.get("calibration_dir"):
             definition["calibration_dir"] = Path(definition["calibration_dir"])
@@ -139,7 +142,7 @@ def build_config(args):
     # --task 是这段示教实际完成的任务标签，之后通过 task_index 与每帧绑定。
     dataset = DatasetRecordConfig(
         repo_id=args.repo_id or f"local/{args.root.name}", root=args.root,
-        single_task=args.task.strip(), fps=args.fps, num_episodes=args.episodes,
+        single_task=args.task.strip(), fps=fps, num_episodes=args.episodes,
         episode_time_s=args.episode_seconds, reset_time_s=args.reset_seconds,
         push_to_hub=False, no_stamp=True, streaming_encoding=True, encoder_threads=2,
     )
