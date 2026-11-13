@@ -283,6 +283,33 @@ def evaluate_subtasks(policy, model, device, root, info, groups, episode_meta, s
     return metrics
 
 
+@torch.no_grad()
+def inspect_subtask(args, root, info, groups, episode_meta):
+    """按原始帧编号比较同一检查点的训练前向与逐词生成。只输出诊断。"""
+    episode, frame = args.inspect_subtask
+    rows = groups.get(episode, ())
+    index = next((i for i, row in enumerate(rows) if row["frame_index"] == frame), None)
+    if index is None:
+        raise ValueError(f"Unknown episode {episode}, frame_index {frame} in {root}")
+    if "subtask" not in rows[index]:
+        raise ValueError(f"No subtask annotation for episode {episode}, frame_index {frame}")
+    configure_cameras(args, info, data.read_json(args.model_dir / "config.json"))
+    stats = pi05.adapter_statistics(args.source_config)
+    model, device = load_training_model(args)
+    pi05.attach_trainables(model, args.rank, args.alpha)
+    policy = pi05.JointPolicy(model, pi05.tokenizer_for(args), args.rank, args.alpha, device)
+    pi05.load_adapter_weights(pi05.trainable_dict(model), args.resume)
+    model.eval().requires_grad_(False)
+    images, masks, goal, label, state, boxes = joint_semantic_inputs(
+        model, device, root, info, groups, episode_meta, stats, args, episode, index)
+    diagnostics = policy.diagnose_subtask(
+        images, masks, goal, label, state, boxes, predict_boxes=args.source_config["predicts_boxes"])
+    data.event("SUBTASK_DIAGNOSTIC", {
+        "checkpoint": str(args.resume), "episode": episode, "frame_index": frame,
+        "global_goal": goal, "reference": label, **diagnostics,
+    })
+
+
 def save_checkpoint(model, optimizer, args, stats, train_ids, val_ids, step, micro_step, output, history, sampler_state):
     """写完权重、优化器、采样状态与元数据后，一次发布可用的断点目录。"""
     from safetensors.torch import save_file
@@ -295,6 +322,7 @@ def save_checkpoint(model, optimizer, args, stats, train_ids, val_ids, step, mic
         "format": JOINT_FORMAT,
         "base_model_dir": str(args.model_dir), "tokenizer_dir": str(args.tokenizer_dir),
         "fast_tokenizer_dir": str(args.fast_tokenizer_dir),
+        "fast_top_id": pi05.FAST_TOP_ID,
         "rank": args.rank, "alpha": args.alpha, "learning_rate": args.lr,
         "joint_order": DATASET_JOINTS, "model_slots": list(range(6)), "supervised_action_dims": 6,
         "horizon": args.horizon, "max_action_dim": args.max_action_dim, "image_keys": args.image_keys,
@@ -341,6 +369,8 @@ def run(args):
     root = args.root.resolve()
     # args.root已由argparse的type=Path转成路径对象；resolve得到绝对路径。
     info, groups, episode_meta = data.load_rows(root)
+    if args.inspect_subtask is not None:
+        return inspect_subtask(args, root, info, groups, episode_meta)
     source_config = args.source_config
     resume_config = source_config if args.resume else None
     if args.train_episodes is None:
@@ -613,6 +643,8 @@ def parse_args(argv=None):
     p.add_argument("--tokenizer-dir", type=Path, help="Text tokenizer (default: assets_root/paligemma_tokenizer)")
     p.add_argument("--fast-tokenizer-dir", type=Path,
                    help="Local snapshot of physical-intelligence/fast (default: project FAST asset)")
+    p.add_argument("--source-fast-top-id", type=int,
+                   help="FAST ID assigned to code 0 when the source checkpoint does not record fast_top_id")
     p.add_argument("--flow-weight", type=float,
                    help="Joint objective: semantic CE + FAST CE + weight * flow MSE (default 10; 0 for discrete only)")
     p.add_argument("--device-map", type=Path, help="Explicit placement map; overrides --gpu-layers")
@@ -635,6 +667,8 @@ def parse_args(argv=None):
                    help="Also generate action chunks and compare joint errors with the hold-current baseline")
     p.add_argument("--eval-subtasks", action=argparse.BooleanOptionalAction, default=None,
                    help="Joint validation: freely generate current subtasks on held-out frames and report exact match")
+    p.add_argument("--inspect-subtask", type=int, nargs=2, metavar=("EP", "FRAME"),
+                   help="Use --resume to inspect first-token scores and free generation for one recorded frame, without training")
     # BooleanOptionalAction提供--eval-actions和--no-eval-actions，分别设True/False。
     # 实际输入无需“=True”；没传时None允许续训继承旧设置。
     p.add_argument("--eval-action-steps", type=int, help="Euler steps for generated validation actions (default: 10)")
@@ -659,6 +693,8 @@ def parse_args(argv=None):
     source.add_argument("--init-from", type=Path,
                         help="初始化新数据集或目标函数的联合适配器权重和归一化")
     args = p.parse_args(argv)
+    if args.inspect_subtask is not None and args.resume is None:
+        p.error("--inspect-subtask requires --resume CHECKPOINT")
     # 到这里才消费输入；--help打印帮助并退出，不继续执行后面的模型加载。
     if args.episode_frames is not None:
         ranges = {}
@@ -679,9 +715,35 @@ def parse_args(argv=None):
     assets = assets_root()
     model_dir = args.model_dir or source_config.get("base_model_dir") or assets / "pi05_base"
     tokenizer_dir = args.tokenizer_dir or source_config.get("tokenizer_dir") or assets / "paligemma_tokenizer"
-    fast_dir = args.fast_tokenizer_dir or source_config.get("fast_tokenizer_dir") or fast_tokenizer_root()
     args.model_dir = Path(model_dir).expanduser().resolve()
     args.tokenizer_dir = Path(tokenizer_dir).expanduser().resolve()
+    if args.root is None:
+        if not args.resume:
+            p.error("--root is required when starting a new training run")
+        args.root = Path(source_config["dataset_root"])
+    args.root = args.root.expanduser().resolve()
+    args.rank = args.rank if args.rank is not None else source_config.get("rank", 8)
+    args.alpha = args.alpha if args.alpha is not None else source_config.get("alpha", 16.0)
+    if source_config and (args.rank != source_config["rank"] or args.alpha != source_config["alpha"]):
+        p.error("rank and alpha must match the source adapter")
+    if args.gpu_layers < 0 or args.cpu_threads < 1 or not np.isfinite(args.chunk_mib) or args.chunk_mib <= 0:
+        p.error("gpu-layers must be nonnegative and cpu-threads and chunk-mib must be positive")
+    if args.inspect_subtask is not None:
+        return args
+    if checkpoint:
+        recorded_top = source_config.get("fast_top_id")
+        if recorded_top is not None and args.source_fast_top_id not in (None, recorded_top):
+            p.error("--source-fast-top-id conflicts with the source checkpoint")
+        source_top = recorded_top if recorded_top is not None else args.source_fast_top_id
+        if source_top is None:
+            p.error("The checkpoint does not record fast_top_id. Verify its original training code, then "
+                    "supply --source-fast-top-id for continued training. Single-frame inspection works without it.")
+        if source_top != pi05.FAST_TOP_ID:
+            p.error(f"Source FAST code 0 maps to {source_top}, current training maps it to {pi05.FAST_TOP_ID}. "
+                    "Start from the base model for the new action vocabulary.")
+    elif args.source_fast_top_id is not None:
+        p.error("--source-fast-top-id requires --resume or --init-from")
+    fast_dir = args.fast_tokenizer_dir or source_config.get("fast_tokenizer_dir") or fast_tokenizer_root()
     args.fast_tokenizer_dir = Path(fast_dir).expanduser().resolve()
     if not args.fast_tokenizer_dir.is_dir():
         p.error(f"Missing FAST+ snapshot directory {args.fast_tokenizer_dir}; supply --fast-tokenizer-dir")
@@ -697,16 +759,7 @@ def parse_args(argv=None):
             setattr(args, key, saved.get(key, default))
     if not np.isfinite(args.flow_weight) or args.flow_weight < 0:
         p.error("--flow-weight must be finite and nonnegative")
-    if args.root is None:
-        if not args.resume:
-            p.error("--root is required when starting a new training run")
-        args.root = Path(source_config["dataset_root"])
-    args.rank = args.rank if args.rank is not None else source_config.get("rank", 8)
-    # 优先级：CLI明确值 > 来源adapter值 > 默认8；is not None用于区分是否明确传参。
-    args.alpha = args.alpha if args.alpha is not None else source_config.get("alpha", 16.0)
     args.lr = args.lr if args.lr is not None else source_config.get("learning_rate", 1e-4)
-    if source_config and (args.rank != source_config["rank"] or args.alpha != source_config["alpha"]):
-        p.error("rank and alpha must match the source adapter")
     if (min(args.steps, args.eval_every, args.log_every) < 1
             or (args.validation_samples is not None and args.validation_samples < 1)):
         p.error("steps, validation-samples, eval-every and log-every must be positive")
@@ -714,15 +767,10 @@ def parse_args(argv=None):
         p.error("--eval-action-steps must be positive")
     if min(args.gradient_accumulation_steps, args.chunk_start_stride) < 1:
         p.error("gradient-accumulation-steps and chunk-start-stride must be positive")
-    if args.save_every < 0 or args.rank < 1 or min(args.lr, args.alpha, args.chunk_mib) <= 0:
-        p.error("Invalid save interval, rank, learning rate, alpha or loading chunk size")
-    if args.gpu_layers < 0:
-        p.error("--gpu-layers must be nonnegative")
-    if args.cpu_threads < 1:
-        p.error("--cpu-threads must be positive")
-    if not all(np.isfinite(value) for value in (args.lr, args.alpha, args.chunk_mib)):
-        p.error("lr, alpha and chunk-mib must be finite")
-    args.root = args.root.expanduser().resolve()
+    if args.save_every < 0 or args.rank < 1 or min(args.lr, args.alpha) <= 0:
+        p.error("Invalid save interval, rank, learning rate or alpha")
+    if not all(np.isfinite(value) for value in (args.lr, args.alpha)):
+        p.error("lr and alpha must be finite")
     if args.output_dir is None:
         from datetime import datetime
         args.output_dir = assets_root() / "checkpoints" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")

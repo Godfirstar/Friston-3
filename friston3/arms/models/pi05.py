@@ -31,7 +31,10 @@ COMPLETE = "Goal complete."
 # tokens，或另加 <image>；len(HF tokenizer) 和 tokenizer.vocab_size 并不总是此值。
 GEMMA_TEXT_VOCAB = 256_000
 PALI_VOCAB = GEMMA_TEXT_VOCAB + 1024 + 128
-FAST_TOP_ID = PALI_VOCAB - 1 - 128
+# π₀.₅ reserves 32 Gemma slots below the location tokens, then 2048 for FAST.
+FAST_VOCAB_SIZE = 2048
+FAST_TOP_ID = GEMMA_TEXT_VOCAB - 32 - 1
+TEXT_VOCAB_END = FAST_TOP_ID + 1 - FAST_VOCAB_SIZE
 
 
 class LoRALinear(nn.Module):
@@ -267,7 +270,7 @@ class FastTokenizer:
         self.min_token = int(config["min_token"])
         self.vocab_size = int(config["vocab_size"])
         self.bpe = Tokenizer.from_file(str(vocabulary))
-        if (not math.isfinite(self.scale) or self.scale <= 0 or not 0 < self.vocab_size <= FAST_TOP_ID
+        if (not math.isfinite(self.scale) or self.scale <= 0 or self.vocab_size != FAST_VOCAB_SIZE
                 or self.bpe.get_vocab_size() != self.vocab_size):
             raise ValueError("FAST processor and BPE vocabulary disagree")
     def encode(self, actions):
@@ -322,6 +325,7 @@ class JointPolicy:
         if len(set(specials)) != 3 or any(i is None or not 0 <= i < GEMMA_TEXT_VOCAB for i in specials):
             raise ValueError("Incompatible PaliGemma BOS/EOS/pad IDs")
         self.specials = set(tokenizer.all_special_ids)
+        self.excluded_text_ids = [i for i in self.specials if 0 <= i < TEXT_VOCAB_END and i != self.eos]
         # Gemma 部分 tokenizer 将普通换行也列入 all_special_ids。提示模板含换行，
         # 标签仍只接受自然文本；分别处理，避免训练在第一个提示上就失败。
         line_break = tokenizer.encode("\n", add_special_tokens=False)
@@ -346,7 +350,7 @@ class JointPolicy:
     def _text(self, text, *, prompt=False):
         ids = self.tokenizer.encode(text, add_special_tokens=False)
         forbidden = self.prompt_specials if prompt else self.specials
-        if not ids or any(i in forbidden or not 0 <= i < GEMMA_TEXT_VOCAB for i in ids):
+        if not ids or any(i in forbidden or not 0 <= i < TEXT_VOCAB_END for i in ids):
             raise ValueError("Expected ordinary PaliGemma text tokens")
         return ids
 
@@ -400,9 +404,12 @@ class JointPolicy:
         logits = self.head(hidden.to(self.head.weight.dtype))[..., :PALI_VOCAB]
         return F.cross_entropy(logits.float(), ids, reduction="sum")
 
-    def _loss(self, inputs, target):
+    def _teacher_features(self, inputs, target):
         hidden, _, _ = self._observe(inputs, target[:-1], use_cache=False)
-        selected = hidden[0, -len(target):]
+        return hidden[0, -len(target):]
+
+    def _loss(self, inputs, target):
+        selected = self._teacher_features(inputs, target)
         target_ids = torch.tensor(target, device=selected.device)
         # 共享词表有 25 万行；分块重算输出层，避免保存整个动作序列的 float32 logits。
         total = selected.new_zeros((), dtype=torch.float32)
@@ -458,20 +465,43 @@ class JointPolicy:
             target.append(separator)
         return target
 
-    def semantic_loss(self, images, img_masks, global_goal, subtask, state, boxes=None):
+    def _semantic_example(self, images, img_masks, global_goal, subtask, state, boxes):
         views = POLICY_IMAGE_KEYS if boxes is not None else ()
         inputs = self._goal_inputs(images, img_masks, global_goal, state, views)
         if subtask is not None and (not isinstance(subtask, str) or not subtask.strip()
                                     or subtask.strip().casefold() == COMPLETE.casefold()):
             raise ValueError("Use null for completion and nonempty text for the current subtask")
         target = self._box_target(boxes) if boxes is not None else []
+        text_offset = len(target)
         target.extend(self._text(COMPLETE if subtask is None else subtask.strip()) + [self.eos])
         if len(target) > self.model.config.tokenizer_max_length:
             raise ValueError("Subtask target is longer than the inference generation budget")
+        return inputs, target, text_offset
+
+    def semantic_loss(self, images, img_masks, global_goal, subtask, state, boxes=None):
+        inputs, target, _ = self._semantic_example(images, img_masks, global_goal, subtask, state, boxes)
         return self._loss(inputs, target)
 
+    def _semantic_scores(self, features, predicting_box=False):
+        end = GEMMA_TEXT_VOCAB + 1024 if predicting_box else TEXT_VOCAB_END
+        scores = self.head(features.to(self.head.weight.dtype))[0, :end].float()
+        if not torch.isfinite(scores).all():
+            raise ValueError("Nonfinite semantic token scores")
+        if not predicting_box:
+            scores[self.excluded_text_ids] = -torch.inf
+        return scores
+
+    def _decode_step(self, token, cache, valid):
+        ids = torch.tensor([[token]], device=self.device)
+        embed, _, _ = self.model.embed_prefix([], [], ids, torch.ones_like(ids, dtype=torch.bool))
+        valid = F.pad(valid, (0, 1), value=True)
+        result = self.language(inputs_embeds=embed, attention_mask=self._mask(valid[:, None, :]),
+                               position_ids=valid.long().sum(1, keepdim=True) - 1,
+                               past_key_values=cache, use_cache=True)
+        return result.last_hidden_state, result.past_key_values, valid
+
     @torch.no_grad()
-    def predict_result(self, images, img_masks, global_goal, state, *, predict_boxes=False):
+    def predict_result(self, images, img_masks, global_goal, state, *, predict_boxes=False, generated_ids=None):
         """按观察视角生成可选目标框，随后生成当前子任务。显式完成文本才表示任务结束。"""
         views = POLICY_IMAGE_KEYS if predict_boxes else ()
         inputs = self._goal_inputs(images, img_masks, global_goal, state, views)
@@ -482,16 +512,11 @@ class JointPolicy:
         boxes = [] if views else None
         view_index, coords = 0, []
         separator = self._box_separator() if predict_boxes else None
-        # 自然语言只在 Gemma 文本词表内生成，保留 EOS；不使用示教候选子任务列表。
-        excluded = [i for i in self.specials if 0 <= i < GEMMA_TEXT_VOCAB and i != self.eos]
         limit = min(self.model.config.tokenizer_max_length,
                     self.language.config.max_position_embeddings - valid.shape[1] + 1)
         for step in range(limit):
             predicting_box = view_index < len(views)
-            vocab_end = GEMMA_TEXT_VOCAB + 1024 if predicting_box else GEMMA_TEXT_VOCAB
-            scores = self.head(hidden[:, -1].to(self.head.weight.dtype))[0, :vocab_end].float()
-            if not torch.isfinite(scores).all():
-                raise ValueError("Nonfinite semantic token scores")
+            scores = self._semantic_scores(hidden[:, -1], predicting_box)
             if predicting_box:
                 # 仅约束输出格式。模型从当前图像学习框数与坐标，分隔符允许零个框。
                 k = len(coords)
@@ -511,8 +536,10 @@ class JointPolicy:
                         boxes.append({"view": views[view_index], "xyxy": [xmin/1023, ymin/1023, xmax/1023, ymax/1023]})
                         coords.clear()
             else:
-                scores[excluded] = -torch.inf
                 token = scores.argmax().item()
+            if generated_ids is not None:
+                generated_ids.append(token)
+            if not predicting_box:
                 if token == self.eos:
                     text = self.tokenizer.decode(phrase, skip_special_tokens=True).strip()
                     if not text:
@@ -521,15 +548,57 @@ class JointPolicy:
                 phrase.append(token)
             if step + 1 == limit:
                 break
-            ids = torch.tensor([[token]], device=self.device)
-            # 走同一个 embed_prefix 的纯文本分支，复用安装版本对语言 embedding 的缩放。
-            embed, _, _ = self.model.embed_prefix([], [], ids, torch.ones_like(ids, dtype=torch.bool))
-            valid = F.pad(valid, (0, 1), value=True)
-            result = self.language(inputs_embeds=embed, attention_mask=self._mask(valid[:, None, :]),
-                                   position_ids=valid.long().sum(1, keepdim=True) - 1,
-                                   past_key_values=cache, use_cache=True)
-            hidden, cache = result.last_hidden_state, result.past_key_values
+            hidden, cache, valid = self._decode_step(token, cache, valid)
         raise SubtaskDecodeError("Generated subtask did not finish with EOS")
+
+    @torch.no_grad()
+    def diagnose_subtask(self, images, img_masks, global_goal, subtask, state, boxes=None, *, predict_boxes=False):
+        """用同一参考前缀比较训练与缓存 logits，并记录部署路径实际生成的 ID。"""
+        inputs, target, text_offset = self._semantic_example(images, img_masks, global_goal, subtask, state, boxes)
+        teacher = self._teacher_features(inputs, target)
+        hidden, cache, valid = self._observe(inputs, [], use_cache=True)
+        for token in target[:text_offset]:
+            hidden, cache, valid = self._decode_step(token, cache, valid)
+
+        comparisons = []
+        for offset, expected in enumerate(target[text_offset:text_offset + 2]):
+            if offset:
+                hidden, cache, valid = self._decode_step(target[text_offset + offset - 1], cache, valid)
+            position = text_offset + offset
+            train_scores = self._semantic_scores(teacher[position:position + 1])
+            cached_scores = self._semantic_scores(hidden[:, -1])
+            allowed = torch.isfinite(train_scores)
+            difference = (train_scores[allowed] - cached_scores[allowed]).abs()
+            token_result = {
+                "expected_id": expected, "expected_token": self.tokenizer.convert_ids_to_tokens(expected),
+                "max_abs_logit_delta": difference.max().item(), "mean_abs_logit_delta": difference.mean().item(),
+            }
+            for name, scores in (("teacher", train_scores), ("cached", cached_scores)):
+                top = scores.topk(5).indices.tolist()
+                token_result[name] = {
+                    "expected_rank": 1 + (scores > scores[expected]).sum().item(),
+                    "eos_rank": 1 + (scores > scores[self.eos]).sum().item(),
+                    "expected_logit": scores[expected].item(), "eos_logit": scores[self.eos].item(),
+                    "argmax_id": scores.argmax().item(), "top_ids": top,
+                    "top_tokens": self.tokenizer.convert_ids_to_tokens(top),
+                    "top_logits": scores[top].tolist(),
+                }
+            comparisons.append(token_result)
+        del teacher, hidden, cache
+
+        generated_ids = []
+        greedy = {"token_ids": generated_ids}
+        try:
+            prediction, predicted_boxes = self.predict_result(
+                images, img_masks, global_goal, state, predict_boxes=predict_boxes, generated_ids=generated_ids)
+            greedy.update(stop_reason="eos", prediction=prediction, predicted_boxes=predicted_boxes)
+        except SubtaskDecodeError as error:
+            stopped_at_eos = bool(generated_ids) and generated_ids[-1] == self.eos
+            greedy.update(stop_reason="empty_at_eos" if stopped_at_eos else "length_limit", decode_error=str(error))
+        greedy["first_tokens"] = self.tokenizer.convert_ids_to_tokens(generated_ids[:5])
+        return {"eos_id": self.eos, "reference_boxes_supplied": boxes is not None,
+                "deployment_predicts_boxes": predict_boxes, "reference_box_token_count": text_offset,
+                "tokens": comparisons, "greedy": greedy}
 
 
 class Pi05Policy:
